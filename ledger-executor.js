@@ -58,12 +58,15 @@ function nativeBLE(action, params = {}) {
         const id = String(++_callbackId);
         _pendingCallbacks.set(id, { resolve, reject });
         try {
-            window.parent.postMessage({
-                type: LEDGER_BLE_REQUEST,
-                id,
-                action,
-                params,
-            }, "*");
+            // Post to all ancestor frames so the native bridge relay receives
+            // the message regardless of iframe nesting depth.
+            const msg = { type: LEDGER_BLE_REQUEST, id, action, params };
+            let target = window.parent;
+            while (target && target !== window) {
+                try { target.postMessage(msg, "*"); } catch {}
+                if (target === target.parent) break;
+                target = target.parent;
+            }
         } catch (e) {
             _pendingCallbacks.delete(id);
             reject(new Error("Native BLE bridge unavailable: " + e.message));
@@ -79,19 +82,21 @@ function nativeBLE(action, params = {}) {
     });
 }
 
-function isNativeBLEAvailable() {
-    // Native BLE bridge is available in iOS (WKWebView) and Android (WebView)
-    // but not in regular browsers. Detect by checking for native-specific globals.
+// Probe the native BLE bridge by sending a lightweight request and waiting for a response.
+// Returns a cached result after the first successful probe.
+let _nativeBLEProbeResult = null;
+async function isNativeBLEAvailable() {
+    if (_nativeBLEProbeResult !== null) return _nativeBLEProbeResult;
     try {
-        if (typeof window === "undefined") return false;
-        // iOS WKWebView: webkit message handlers injected by native code
-        if (window.webkit?.messageHandlers) return true;
-        // Android WebView: check for Android WebView user agent
-        if (/; wv\)/.test(navigator.userAgent) || /Android.*Version\/[\d.]+.*Chrome\/[\d.]+ Mobile/.test(navigator.userAgent)) return true;
-        return false;
+        await Promise.race([
+            nativeBLE("isConnected"),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 500)),
+        ]);
+        _nativeBLEProbeResult = true;
     } catch {
-        return false;
+        _nativeBLEProbeResult = false;
     }
+    return _nativeBLEProbeResult;
 }
 
 // ============================================================================
@@ -1072,7 +1077,7 @@ async function promptForLedgerConnect() {
     const storedMode = await window.selector.storage.get(STORAGE_KEY_TRANSPORT_MODE);
     const usbAvailable = isWebUsbSupported() || isWebHidSupported();
     const webBleAvailable = isWebBleSupported();
-    const nativeBleAvailable = isNativeBLEAvailable();
+    const nativeBleAvailable = await isNativeBLEAvailable();
     const bleAvailable = webBleAvailable || nativeBleAvailable;
     const bleTransportMode = webBleAvailable ? TRANSPORT_WEB_BLE : TRANSPORT_NATIVE_BLE;
     const usbLastUsed = storedMode === TRANSPORT_WEB_USB || storedMode === TRANSPORT_WEB_HID;
