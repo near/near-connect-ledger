@@ -617,6 +617,16 @@ async function transportConnect(mode) {
             _activeTransportMode = null;
         });
     } else if (mode === TRANSPORT_NATIVE_BLE) {
+        // Check if native side already has a connected device (e.g. from a previous iframe session)
+        let alreadyConnected = false;
+        try { alreadyConnected = await nativeBLE("isConnected"); } catch {}
+        if (alreadyConnected) {
+            _activeTransport = { name: "connected" };
+            _activeTransportMode = TRANSPORT_NATIVE_BLE;
+            return;
+        }
+        // Disconnect any stale native connection before scanning
+        try { await nativeBLE("disconnect"); } catch {}
         await nativeBLE("scan");
         await new Promise(r => setTimeout(r, 3000));
         await nativeBLE("stopScan");
@@ -1824,7 +1834,18 @@ class LedgerWallet {
             }
         }
 
-        // BLE and HID require requestDevice() which needs a user gesture.
+        // Native BLE can reconnect silently — the native side persists the connection across iframe lifecycles
+        if (storedMode === TRANSPORT_NATIVE_BLE) {
+            try {
+                await transportConnect(TRANSPORT_NATIVE_BLE);
+                await openNearApplication();
+                return;
+            } catch {
+                // Native BLE reconnect failed — fall through to manual reconnect
+            }
+        }
+
+        // Web BLE and HID require requestDevice() which needs a user gesture.
         // Show a "Connect" button so the click provides the gesture context.
         await window.selector.ui.showIframe();
         const root = document.getElementById("root");
@@ -1843,7 +1864,7 @@ class LedgerWallet {
                         </button>
                       </div>
                       <p style="font-family:-apple-system,sans-serif; font-size:16px; color:#a3a3a3; line-height:1.5; margin:0;">
-                        Please make sure your Ledger device is ${storedMode === TRANSPORT_WEB_BLE ? "nearby and Bluetooth is enabled" : "connected via USB"}.
+                        Please make sure your Ledger device is ${(storedMode === TRANSPORT_WEB_BLE || storedMode === TRANSPORT_NATIVE_BLE) ? "nearby and Bluetooth is enabled" : "connected via USB"}.
                       </p>
                     </div>
                     ${errorMessage ? alertBox(errorMessage) : ""}
