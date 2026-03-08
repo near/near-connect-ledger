@@ -1087,6 +1087,93 @@ async function promptForLedgerConnect() {
     const root = document.getElementById("root");
     root.style.display = "flex";
 
+    async function directConnect(mode) {
+        function renderConnecting(statusMessage) {
+            root.style.display = "flex";
+            root.innerHTML = `
+            <style>@keyframes ledger-connect-spin { to { transform: rotate(360deg); } }</style>
+            <div style="display:flex; flex-direction:column; width:100%; height:100%; background:#000; border-radius:24px; overflow:hidden; text-align:left;">
+              <div style="flex:1; padding:24px; display:flex; flex-direction:column; gap:32px;">
+                <div style="display:flex; flex-direction:column; gap:12px; padding-top:20px;">
+                  <span style="font-family:-apple-system,sans-serif; font-weight:600; font-size:24px; color:#fafafa;">Connect Ledger</span>
+                  <p style="font-family:-apple-system,sans-serif; font-size:16px; color:#a3a3a3; line-height:1.5; margin:0;">${statusMessage}</p>
+                </div>
+                <div style="display:flex; align-items:center; justify-content:center; padding:22.5px 0;">
+                  <div style="width:44px; height:44px; border:3px solid #313131; border-top-color:#fafafa; border-radius:50%; animation:ledger-connect-spin 1s linear infinite;"></div>
+                </div>
+              </div>
+            </div>`;
+        }
+        function renderRetry(errorMessage) {
+            root.style.display = "flex";
+            root.innerHTML = `
+            <div style="display:flex; flex-direction:column; width:100%; height:100%; background:#000; border-radius:24px; overflow:hidden; text-align:left;">
+              <div style="flex:1; padding:24px; display:flex; flex-direction:column; gap:32px; overflow:auto;">
+                <div style="display:flex; flex-direction:column; gap:12px; padding-top:20px;">
+                  <div style="display:flex; align-items:center; justify-content:space-between;">
+                    <span style="font-family:-apple-system,sans-serif; font-weight:600; font-size:24px; color:#fafafa;">Connect Ledger</span>
+                    <button id="cancelBtn" style="background:transparent; border:none; cursor:pointer; padding:4px;">
+                      <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1L13 13M13 1L1 13" stroke="#fafafa" stroke-width="1.5" stroke-linecap="round"/></svg>
+                    </button>
+                  </div>
+                  <p style="font-family:-apple-system,sans-serif; font-size:16px; color:#a3a3a3; line-height:1.5; margin:0;">
+                    Make sure your Ledger device is ${mode === TRANSPORT_NATIVE_BLE || mode === TRANSPORT_WEB_BLE ? "nearby with Bluetooth enabled" : "connected via USB"} and the <strong style="color:#fafafa;">NEAR app</strong> is installed.
+                  </p>
+                </div>
+                <div style="display:flex; flex-direction:column; gap:16px;">
+                  ${alertBox(errorMessage)}
+                  <button id="retryBtn" style="width:100%; padding:9.5px 24px; border-radius:8px; border:none; background:#f5f5f5; color:#0a0a0a; cursor:pointer; font-family:-apple-system,sans-serif; font-size:14px; font-weight:500;">Retry</button>
+                  <button id="closeBtn" style="width:100%; padding:9.5px 24px; border-radius:8px; border:1px solid #404040; background:rgba(255,255,255,0.05); color:#fafafa; cursor:pointer; font-family:-apple-system,sans-serif; font-size:14px; font-weight:500;">Close</button>
+                </div>
+              </div>
+            </div>`;
+        }
+
+        return new Promise(async (resolve, reject) => {
+            async function attempt() {
+                try {
+                    if (!(await transportIsConnected()) || _activeTransportMode !== mode) {
+                        if (await transportIsConnected()) await transportDisconnect();
+                        renderConnecting("Connecting to your Ledger device…");
+                        await transportConnect(mode);
+                        await window.selector.storage.set(STORAGE_KEY_TRANSPORT_MODE, mode);
+                    }
+                    renderConnecting("Please approve opening the NEAR app on your Ledger device.");
+                    await openNearApplication();
+                    resolve();
+                } catch (error) {
+                    const errorMsg = getLedgerErrorMessage(error);
+                    if (!isGuidanceMessage(errorMsg) && await transportIsConnected()) {
+                        await transportDisconnect();
+                    }
+                    renderRetry(errorMsg);
+                    document.getElementById("retryBtn").addEventListener("click", attempt);
+                    document.getElementById("closeBtn").addEventListener("click", () => {
+                        root.innerHTML = "";
+                        root.style.display = "none";
+                        window.selector.ui.hideIframe();
+                        reject(new Error("User cancelled"));
+                    });
+                    document.getElementById("cancelBtn").addEventListener("click", () => {
+                        root.innerHTML = "";
+                        root.style.display = "none";
+                        window.selector.ui.hideIframe();
+                        reject(new Error("User cancelled"));
+                    });
+                }
+            }
+            await attempt();
+        });
+    }
+
+    // If only one transport is available, skip selection and connect directly
+    if (bleAvailable && !usbAvailable) {
+        return await directConnect(bleTransportMode);
+    }
+    if (usbAvailable && !bleAvailable) {
+        return await directConnect(TRANSPORT_WEB_USB);
+    }
+
     const transportButtons = [
         {
             id: "usbBtn",
@@ -1095,7 +1182,7 @@ async function promptForLedgerConnect() {
             description: "Wired Ledger connection",
             available: usbAvailable,
             lastUsed: usbLastUsed,
-            unsupportedReason: usbAvailable ? null : "WebHID is not supported in this browser. Try Chrome or Edge.",
+            unsupportedReason: usbAvailable ? null : "USB is not supported in this environment. Try Chrome or Edge for WebUSB/WebHID support.",
         },
         {
             id: "bleBtn",
@@ -1104,7 +1191,7 @@ async function promptForLedgerConnect() {
             description: "Wireless Ledger connection",
             available: bleAvailable,
             lastUsed: bleLastUsed,
-            unsupportedReason: bleAvailable ? null : "Bluetooth is not available in this environment. Try Chrome or Edge.",
+            unsupportedReason: bleAvailable ? null : "Bluetooth is not available in this environment. Try Chrome or Edge for WebBLE support.",
         },
     ];
 
