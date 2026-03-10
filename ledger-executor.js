@@ -2188,9 +2188,13 @@ class LedgerWallet {
         const signerId = accounts[0].accountId;
         const { receiverId, actions } = params;
 
-        const { accessKey, block } = await this._getAccessKeyAndBlock(network, signerId, accounts[0].publicKey);
-        const blockHash = base58Decode(block.header.hash);
-        const nonce = BigInt(accessKey.nonce) + 1n;
+        let blockHash = params.blockHash;
+        let nonce = params.nonce;
+        if (blockHash == null || nonce == null) {
+            const { accessKey, block } = await this._getAccessKeyAndBlock(network, signerId, accounts[0].publicKey);
+            blockHash ??= base58Decode(block.header.hash);
+            nonce ??= BigInt(accessKey.nonce) + 1n;
+        }
 
         const txBytes = buildTransaction(signerId, accounts[0].publicKey, receiverId, nonce, actions, blockHash);
         const derivationPath = await this.getDerivationPath();
@@ -2214,13 +2218,23 @@ class LedgerWallet {
     }
 
     async signAndSendTransactions(params) {
+        const accounts = await this._ensureReady();
+        const network = params.network || "mainnet";
+        const signerId = accounts[0].accountId;
+
+        const { accessKey, block } = await this._getAccessKeyAndBlock(network, signerId, accounts[0].publicKey);
+        const blockHash = base58Decode(block.header.hash);
+        let nonce = BigInt(accessKey.nonce);
+
         const results = [];
         for (const tx of params.transactions) {
+            nonce += 1n;
             const result = await this.signAndSendTransaction({
-                network: params.network,
-                signerId: params.signerId,
+                network,
                 receiverId: tx.receiverId,
                 actions: tx.actions,
+                nonce,
+                blockHash,
             });
             results.push(result);
         }
@@ -2233,11 +2247,13 @@ class LedgerWallet {
         const { accountId: signerId, publicKey } = accounts[0];
         const derivationPath = await this.getDerivationPath();
 
+        const { accessKey, block } = await this._getAccessKeyAndBlock(network, signerId, publicKey);
+        let nonce = BigInt(accessKey.nonce);
+        const maxBlockHeight = BigInt(block.header.height) + 120n;
+
         const signedDelegateActions = [];
         for (const { receiverId, actions } of params.delegateActions) {
-            const { accessKey, block } = await this._getAccessKeyAndBlock(network, signerId, publicKey);
-            const nonce = BigInt(accessKey.nonce) + 1n;
-            const maxBlockHeight = BigInt(block.header.height) + 120n;
+            nonce += 1n;
 
             const daBytes = buildDelegateActionBytes(signerId, receiverId, actions, nonce, maxBlockHeight, publicKey);
 
