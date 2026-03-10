@@ -917,7 +917,11 @@ async function rpcRequest(network, method, params) {
         body: JSON.stringify({ jsonrpc: "2.0", id: "dontcare", method, params }),
     });
     const json = await response.json();
-    if (json.error) throw new Error(json.error.message || "RPC request failed");
+    if (json.error) {
+        const err = new Error(json.error.message || "RPC request failed");
+        err.cause = json.error.cause;
+        throw err;
+    }
     if (json.result?.error) {
         const errMsg = typeof json.result.error === "string" ? json.result.error : JSON.stringify(json.result.error);
         throw new Error(errMsg);
@@ -1620,7 +1624,8 @@ async function verifyAccessKey(network, accountId, publicKey) {
         });
     } catch (error) {
         const msg = error.message || "";
-        if (error.data?.includes("does not exist") || msg.includes("does not exist") || error.data?.includes("UnknownAccount") || msg.includes("UnknownAccount") || error.data?.includes("AccountDoesNotExist") || msg.includes("AccountDoesNotExist")) {
+        const causeName = error.cause?.name || "";
+        if (causeName === "UNKNOWN_ACCOUNT" || error.data?.includes("does not exist") || msg.includes("does not exist") || error.data?.includes("UnknownAccount") || msg.includes("UnknownAccount") || error.data?.includes("AccountDoesNotExist") || msg.includes("AccountDoesNotExist")) {
             const err = new Error(`Account ${accountId} does not exist yet.`);
             err.code = "ACCOUNT_CREATION_REQUIRED";
             throw err;
