@@ -1393,7 +1393,7 @@ async function promptForDerivationPath(currentPath = DEFAULT_DERIVATION_PATH) {
 // Account ID Input UI
 // ============================================================================
 
-async function promptForAccountId(foundAccounts = [], implicitAccountId = "", onVerify = null, hideOnSuccess = true) {
+async function promptForAccountId(foundAccounts = [], implicitAccountId = "", onVerify = null, onCreateAccount = null, hideOnSuccess = true) {
     await window.selector.ui.showIframe();
     const root = document.getElementById("root");
     root.style.display = "flex";
@@ -1488,8 +1488,28 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
                         }
                         resolve(accountId);
                     } catch (error) {
-                        renderUI(error.message, "", false);
-                        setupListeners();
+                        if (error?.code === "ACCOUNT_CREATION_REQUIRED" && onCreateAccount) {
+                            try {
+                                const created = await promptForCreateAccount(accountId, error.message, onCreateAccount);
+                                if (created) {
+                                    if (hideOnSuccess) {
+                                        root.innerHTML = "";
+                                        root.style.display = "none";
+                                        window.selector.ui.hideIframe();
+                                    }
+                                    resolve(accountId);
+                                    return;
+                                }
+                                renderUI(null, "", false);
+                                setupListeners();
+                            } catch (createError) {
+                                renderUI(createError.message, "", false);
+                                setupListeners();
+                            }
+                        } else {
+                            renderUI(error.message, "", false);
+                            setupListeners();
+                        }
                     }
                 } else {
                     if (hideOnSuccess) {
@@ -1544,8 +1564,28 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
                             }
                             resolve(accountId);
                         } catch (error) {
-                            renderUI(error.message, accountId, true);
-                            setupListeners();
+                            if (error?.code === "ACCOUNT_CREATION_REQUIRED" && onCreateAccount) {
+                                try {
+                                    const created = await promptForCreateAccount(accountId, error.message, onCreateAccount);
+                                    if (created) {
+                                        if (hideOnSuccess) {
+                                            root.innerHTML = "";
+                                            root.style.display = "none";
+                                            window.selector.ui.hideIframe();
+                                        }
+                                        resolve(accountId);
+                                        return;
+                                    }
+                                    renderUI(null, accountId, true);
+                                    setupListeners();
+                                } catch (createError) {
+                                    renderUI(createError.message, accountId, true);
+                                    setupListeners();
+                                }
+                            } else {
+                                renderUI(error.message, accountId, true);
+                                setupListeners();
+                            }
                         }
                     } else {
                         if (hideOnSuccess) {
@@ -1581,7 +1621,9 @@ async function verifyAccessKey(network, accountId, publicKey) {
     } catch (error) {
         const msg = error.message || "";
         if (msg.includes("does not exist") || msg.includes("UnknownAccount")) {
-            throw new Error(`Account ${accountId} does not exist on the NEAR blockchain.`);
+            const err = new Error(`Account ${accountId} does not exist yet.`);
+            err.code = "ACCOUNT_CREATION_REQUIRED";
+            throw err;
         }
         throw error;
     }
@@ -1605,6 +1647,88 @@ async function verifyAccessKey(network, accountId, publicKey) {
         }
         throw error;
     }
+}
+
+// ============================================================================
+// Account Creation
+// ============================================================================
+
+async function createUserAccountViaApi(accountId, publicKey) {
+    const response = await fetch("https://api.trezu.app/api/user/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accountId, publicKey }),
+    });
+
+    let body = null;
+    try { body = await response.json(); } catch {}
+
+    if (!response.ok) {
+        const message =
+            body?.error ||
+            body?.message ||
+            (typeof body === "string" ? body : null) ||
+            "Failed to create account. Please try again.";
+        throw new Error(message);
+    }
+
+    return body;
+}
+
+async function promptForCreateAccount(accountId, reasonMessage, onCreateAccount) {
+    const root = document.getElementById("root");
+    root.style.display = "flex";
+
+    function renderUI(errorMessage = null) {
+        const alertMessage = errorMessage || reasonMessage;
+        root.innerHTML = `
+        <div style="display:flex; flex-direction:column; width:100%; height:100%; background:#000; border-radius:24px; overflow:hidden; text-align:left;">
+          <div style="flex:1; padding:24px; display:flex; flex-direction:column; gap:32px; overflow:auto;">
+            <div style="display:flex; flex-direction:column; gap:12px; padding-top:20px;">
+              <span style="font-family:-apple-system,sans-serif; font-weight:600; font-size:24px; color:#fafafa;">Account Doesn't Exist</span>
+              <p style="font-family:-apple-system,sans-serif; font-size:14px; color:#a3a3a3; line-height:1.5; margin:0; overflow-wrap:anywhere; word-break:break-word;">
+                The account <strong style="color:#fafafa;">${accountId}</strong> does not exist on NEAR blockchain. Do you want to create it now?
+              </p>
+            </div>
+            <div style="display:flex; flex-direction:column; gap:16px;">
+              ${alertMessage ? alertBox(alertMessage) : ""}
+              <div style="display:flex; flex-direction:column; gap:8px; padding-top:${alertMessage ? "0" : "16px"};">
+                <button id="createAccountCancelBtn" style="width:100%; padding:9.5px 24px; border-radius:8px; border:1px solid #404040; background:rgba(255,255,255,0.05); color:#fafafa; cursor:pointer; font-family:-apple-system,sans-serif; font-size:14px; font-weight:500;">Cancel</button>
+                <button id="createAccountConfirmBtn" style="width:100%; padding:9.5px 24px; border-radius:8px; border:none; background:#f5f5f5; color:#0a0a0a; cursor:pointer; font-family:-apple-system,sans-serif; font-size:14px; font-weight:500;">Create Account</button>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    renderUI();
+
+    return new Promise((resolve, reject) => {
+        function setupListeners() {
+            const cancelBtn = document.getElementById("createAccountCancelBtn");
+            const createBtn = document.getElementById("createAccountConfirmBtn");
+
+            cancelBtn.addEventListener("click", () => { resolve(false); });
+
+            createBtn.addEventListener("click", async () => {
+                createBtn.disabled = true;
+                createBtn.textContent = "Creating...";
+                try {
+                    await onCreateAccount(accountId);
+                    resolve(true);
+                } catch (error) {
+                    renderUI(error.message || "Failed to create account.");
+                    setupListeners();
+                }
+            });
+        }
+
+        try {
+            setupListeners();
+        } catch (error) {
+            reject(error);
+        }
+    });
 }
 
 // ============================================================================
@@ -2050,7 +2174,11 @@ class LedgerWallet {
             await verifyAccessKey(network, accountId, publicKey);
         };
 
-        const accountId = await promptForAccountId(foundAccounts, implicitAccountId, verifyAccount, false);
+        const createUserAccount = async (accountId) => {
+            await createUserAccountViaApi(accountId, publicKey);
+        };
+
+        const accountId = await promptForAccountId(foundAccounts, implicitAccountId, verifyAccount, createUserAccount, false);
 
         const accounts = [{ accountId, publicKey }];
         await window.selector.storage.set(STORAGE_KEY_ACCOUNTS, JSON.stringify(accounts));
