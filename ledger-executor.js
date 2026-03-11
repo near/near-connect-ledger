@@ -33,6 +33,7 @@ function isWebBleSupported() {
 // Message types for parent frame relay
 const LEDGER_BLE_REQUEST = "near-connect:ledger-ble:request";
 const LEDGER_BLE_RESPONSE = "near-connect:ledger-ble:response";
+const MAX_BLOCK_HEIGHT_INCREMENT = 900n; // About 15 minutes
 
 // Pending callback map for async native bridge responses
 const _pendingCallbacks = new Map();
@@ -2382,7 +2383,7 @@ class LedgerWallet {
 
         const { accessKey, block } = await this._getAccessKeyAndBlock(network, signerId, publicKey);
         let nonce = BigInt(accessKey.nonce);
-        const maxBlockHeight = BigInt(block.header.height) + 120n;
+        const maxBlockHeight = BigInt(block.header.height) + MAX_BLOCK_HEIGHT_INCREMENT;
 
         const signedDelegateActions = [];
         for (const { receiverId, actions } of params.delegateActions) {
