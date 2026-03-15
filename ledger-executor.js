@@ -933,7 +933,7 @@ async function rpcRequest(network, method, params) {
 async function lookupAccountsByPublicKey(network, publicKey) {
     const baseUrl = network === "testnet"
         ? "https://api.testnet.fastnear.com"
-        : "https://api.fastnear.com";
+        : "https://api.mainnet.fastnear.com";
     try {
         const response = await fetch(`${baseUrl}/v0/public_key/${publicKey}`);
         if (!response.ok) return [];
