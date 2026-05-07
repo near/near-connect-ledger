@@ -1333,7 +1333,25 @@ async function promptForDerivationPath(currentPath = DEFAULT_DERIVATION_PATH) {
         { label: "Account 3", path: "44'/397'/0'/0'/2'" },
     ];
 
+    const customPathPrefix = "44'/397'/0'/0'/";
+    const customPathSuffix = "'";
+    function buildCustomPath(idx) {
+        return `${customPathPrefix}${idx}${customPathSuffix}`;
+    }
+    function isPresetPath(path) {
+        return pathOptions.some(opt => opt.path === path);
+    }
+
+    // If incoming path is not one of the presets, treat it as custom and preselect.
+    let isCustomSelected = !isPresetPath(currentPath);
+    let customIndexValue = "";
+    if (isCustomSelected) {
+        const m = currentPath.match(/^44'\/397'\/0'\/0'\/(\d+)'$/);
+        customIndexValue = m ? m[1] : "";
+    }
+
     function renderUI() {
+        const customBorder = isCustomSelected ? "#a6a6a6" : "#313131";
         root.innerHTML = `
         <div style="display:flex; flex-direction:column; width:100%; height:100%; background:#000; border-radius:24px; overflow:hidden; text-align:left;">
           <div style="flex:1; padding:24px; display:flex; flex-direction:column; justify-content:space-between; overflow:hidden;">
@@ -1346,13 +1364,22 @@ async function promptForDerivationPath(currentPath = DEFAULT_DERIVATION_PATH) {
               </div>
               <p style="font-family:-apple-system,sans-serif; font-size:16px; color:#a3a3a3; line-height:1.5; margin:0;">Choose account index to use from your Ledger.</p>
             </div>
-            <div style="display:flex; flex-direction:column; gap:16px; flex:1; padding-top:32px;">
+            <div style="display:flex; flex-direction:column; gap:12px; flex:1; padding-top:24px; overflow-y:auto;">
               ${pathOptions.map(opt => `
-                <button class="path-btn" data-path="${opt.path}" style="width:100%; padding:12px; border-radius:12px; border:1px solid ${currentPath === opt.path ? "#a6a6a6" : "#313131"}; background:#1a1a1a; cursor:pointer; text-align:left;">
+                <button class="path-btn" data-path="${opt.path}" style="width:100%; padding:12px; border-radius:12px; border:1px solid ${!isCustomSelected && currentPath === opt.path ? "#a6a6a6" : "#313131"}; background:#1a1a1a; cursor:pointer; text-align:left;">
                   <div style="font-family:-apple-system,sans-serif; font-weight:600; font-size:16px; color:#f5f5f5; line-height:1.5;">${opt.label}</div>
                   <div style="font-family:-apple-system,sans-serif; font-size:12px; color:#a3a3a3; line-height:1.5;">${opt.path}</div>
                 </button>
               `).join("")}
+              <div id="customWrap" class="custom-wrap" style="width:100%; padding:12px; border-radius:12px; border:1px solid ${customBorder}; background:#1a1a1a; cursor:pointer; text-align:left;">
+                <div style="font-family:-apple-system,sans-serif; font-weight:600; font-size:16px; color:#f5f5f5; line-height:1.5;">Custom Index</div>
+                <div style="display:flex; align-items:center; gap:6px; margin-top:6px; font-family:-apple-system,sans-serif; font-size:12px; color:#a3a3a3; line-height:1.5;">
+                  <span>${customPathPrefix}</span>
+                  <input id="customIdx" type="number" min="0" step="1" inputmode="numeric" placeholder="0" value="${customIndexValue}" style="width:80px; padding:4px 8px; border-radius:6px; border:1px solid #313131; background:#0a0a0a; color:#f5f5f5; font-family:-apple-system,sans-serif; font-size:12px;" />
+                  <span>${customPathSuffix}</span>
+                </div>
+                <div id="customError" style="display:none; margin-top:6px; font-family:-apple-system,sans-serif; font-size:12px; color:#ef4444; line-height:1.5;"></div>
+              </div>
             </div>
             <div style="padding-top:16px;">
               <button id="confirmBtn" style="width:100%; padding:9.5px 24px; border-radius:8px; border:none; background:#f5f5f5; color:#0a0a0a; cursor:pointer; font-family:-apple-system,sans-serif; font-size:14px; font-weight:500;">Continue</button>
@@ -1364,20 +1391,79 @@ async function promptForDerivationPath(currentPath = DEFAULT_DERIVATION_PATH) {
     renderUI();
 
     return new Promise((resolve, reject) => {
+        function validateCustom() {
+            const errEl = document.getElementById("customError");
+            const trimmed = customIndexValue.trim();
+            if (trimmed === "") {
+                errEl.style.display = "block";
+                errEl.textContent = "Enter an account index.";
+                return null;
+            }
+            if (!/^\d+$/.test(trimmed)) {
+                errEl.style.display = "block";
+                errEl.textContent = "Index must be a non-negative integer.";
+                return null;
+            }
+            // BIP32 hardened child index must fit in 31 bits.
+            const idx = Number(trimmed);
+            if (!Number.isSafeInteger(idx) || idx > 0x7fffffff) {
+                errEl.style.display = "block";
+                errEl.textContent = "Index out of range (max 2147483647).";
+                return null;
+            }
+            errEl.style.display = "none";
+            errEl.textContent = "";
+            return buildCustomPath(idx);
+        }
+
         function setupListeners() {
             const confirmBtn = document.getElementById("confirmBtn");
             const cancelBtn = document.getElementById("cancelBtn");
             const pathBtns = document.querySelectorAll(".path-btn");
+            const customWrap = document.getElementById("customWrap");
+            const customIdx = document.getElementById("customIdx");
 
             pathBtns.forEach(btn => {
                 btn.addEventListener("click", () => {
                     currentPath = btn.dataset.path;
+                    isCustomSelected = false;
                     renderUI();
                     setupListeners();
                 });
             });
 
+            // Selecting the custom card (but not its input) marks it active.
+            customWrap.addEventListener("click", (e) => {
+                if (e.target === customIdx) return;
+                if (!isCustomSelected) {
+                    isCustomSelected = true;
+                    renderUI();
+                    setupListeners();
+                    document.getElementById("customIdx").focus();
+                }
+            });
+
+            customIdx.addEventListener("focus", () => {
+                if (!isCustomSelected) {
+                    isCustomSelected = true;
+                    renderUI();
+                    setupListeners();
+                    document.getElementById("customIdx").focus();
+                }
+            });
+
+            customIdx.addEventListener("input", (e) => {
+                customIndexValue = e.target.value;
+                isCustomSelected = true;
+                validateCustom();
+            });
+
             confirmBtn.addEventListener("click", () => {
+                if (isCustomSelected) {
+                    const path = validateCustom();
+                    if (!path) return;
+                    currentPath = path;
+                }
                 root.innerHTML = "";
                 root.style.display = "none";
                 resolve(currentPath);
