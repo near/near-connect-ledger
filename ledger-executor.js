@@ -832,7 +832,7 @@ async function getPublicKey(path) {
     return response.subarray(0, response.length - 2);
 }
 
-async function sign(transactionData, path) {
+async function sign(transactionData, path, onProgress) {
     transactionData = new Uint8Array(transactionData);
 
     // Detect NEP-413 prefix
@@ -861,11 +861,17 @@ async function sign(transactionData, path) {
     if (isNep413) code = SIGN_MESSAGE;
     else if (isNep366) code = SIGN_META_TRANSACTION;
 
+    const totalChunks = Math.max(1, Math.ceil(allData.length / CHUNK_SIZE));
+    let sentChunks = 0;
+    if (onProgress) onProgress(0, totalChunks);
+
     let lastResponse;
     for (let offset = 0; offset < allData.length; offset += CHUNK_SIZE) {
         const chunk = allData.slice(offset, offset + CHUNK_SIZE);
         const isLastChunk = offset + CHUNK_SIZE >= allData.length;
         const response = await ledgerSend(0x80, code, isLastChunk ? 0x80 : 0, networkId, chunk);
+        sentChunks++;
+        if (onProgress) onProgress(sentChunks, totalChunks);
         if (isLastChunk) {
             lastResponse = response.subarray(0, response.length - 2);
         }
@@ -979,6 +985,18 @@ function formatNearAmount(yocto) {
     return frac ? `${whole}.${frac}` : whole;
 }
 
+// Chunked base64 encode for Uint8Array. `btoa(String.fromCharCode(...bytes))`
+// overflows the call stack for large payloads (e.g. 0.5MB+ signed txs) because
+// the spread pushes every byte as a separate argument.
+function bytesToBase64(bytes) {
+    const CHUNK = 0x8000;
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+}
+
 // ============================================================================
 // UI Helpers
 // ============================================================================
@@ -1010,11 +1028,36 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
               <span style="font-family:-apple-system,sans-serif; font-weight:600; font-size:24px; color:#fafafa;">${title}</span>
               <p style="font-family:-apple-system,sans-serif; font-size:16px; color:#a3a3a3; line-height:1.5; margin:0;">${message}</p>
             </div>
-            <div style="display:flex; align-items:center; justify-content:center; padding:22.5px 0;">
+            <div id="ledgerSpinner" style="display:flex; align-items:center; justify-content:center; padding:22.5px 0;">
               <div style="width:44px; height:44px; border:3px solid #313131; border-top-color:#fafafa; border-radius:50%; animation:ledger-spin 1s linear infinite;"></div>
+            </div>
+            <div id="ledgerProgress" style="display:none; flex-direction:column; gap:8px; padding:14px 0;">
+              <div style="width:100%; height:8px; background:#1a1a1a; border-radius:4px; overflow:hidden;">
+                <div id="ledgerProgressBar" style="height:100%; width:0%; background:#fafafa; transition:width 200ms ease-out;"></div>
+              </div>
+              <p id="ledgerProgressText" style="font-family:-apple-system,sans-serif; font-size:12px; color:#a3a3a3; margin:0; text-align:center;"></p>
             </div>
           </div>
         </div>`;
+    }
+
+    // Threshold: hide the spinner and show a progress bar only for transfers large
+    // enough that users would otherwise think the device hung (1MB tx ≈ 8500 chunks
+    // and can take 10–20 min over BLE).
+    const PROGRESS_BAR_MIN_CHUNKS = 16;
+
+    function reportProgress(current, total) {
+        const bar = document.getElementById("ledgerProgressBar");
+        const text = document.getElementById("ledgerProgressText");
+        const spinner = document.getElementById("ledgerSpinner");
+        const progress = document.getElementById("ledgerProgress");
+        if (!bar || !text || !progress) return;
+        if (total < PROGRESS_BAR_MIN_CHUNKS) return;
+        if (spinner) spinner.style.display = "none";
+        progress.style.display = "flex";
+        const pct = total > 0 ? Math.min(100, Math.floor((current / total) * 100)) : 0;
+        bar.style.width = `${pct}%`;
+        text.textContent = `Sending to Ledger: ${current} / ${total} chunks (${pct}%)`;
     }
 
     function renderErrorUI(error) {
@@ -1051,7 +1094,7 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
     while (true) {
         renderLoadingUI();
         try {
-            const result = await asyncOperation();
+            const result = await asyncOperation(reportProgress);
             if (hideOnSuccess) {
                 root.innerHTML = "";
                 root.style.display = "none";
@@ -2328,7 +2371,7 @@ class LedgerWallet {
         const signature = await showLedgerApprovalUI(
             "Grant App Access",
             `This transaction adds an access key that allows the application to call ${methodDesc} on <strong style="color:#fafafa;">${contractId}</strong> using ${allowanceDesc} on behalf of your account. Your funds remain safe — the key can only be used for gas fees, not transfers.`,
-            () => sign(txBytes, derivationPath),
+            (onProgress) => sign(txBytes, derivationPath, onProgress),
             true,
         );
 
@@ -2338,7 +2381,7 @@ class LedgerWallet {
         signedTx[txBytes.length] = 0; // ed25519
         signedTx.set(signature.subarray(0, 64), txBytes.length + 1);
 
-        const base64Tx = btoa(String.fromCharCode(...signedTx));
+        const base64Tx = bytesToBase64(signedTx);
         await rpcRequest(network, "broadcast_tx_commit", [base64Tx]);
     }
 
@@ -2368,11 +2411,11 @@ class LedgerWallet {
             const signature = await showLedgerApprovalUI(
                 "Sign Message",
                 "Please review and approve the message signing on your Ledger device.",
-                () => sign(dataWithPrefix, derivationPath),
+                (onProgress) => sign(dataWithPrefix, derivationPath, onProgress),
                 true,
             );
 
-            const signatureBase64 = btoa(String.fromCharCode(...signature));
+            const signatureBase64 = bytesToBase64(signature);
 
             return accounts.map(account => ({
                 ...account,
@@ -2422,7 +2465,7 @@ class LedgerWallet {
         const signature = await showLedgerApprovalUI(
             "Approve Transaction",
             "Please review and approve the transaction on your Ledger device.",
-            () => sign(txBytes, derivationPath),
+            (onProgress) => sign(txBytes, derivationPath, onProgress),
             true,
         );
 
@@ -2432,7 +2475,7 @@ class LedgerWallet {
         signedTx[txBytes.length] = 0; // ed25519
         signedTx.set(signature.subarray(0, 64), txBytes.length + 1);
 
-        const base64Tx = btoa(String.fromCharCode(...signedTx));
+        const base64Tx = bytesToBase64(signedTx);
         const result = await rpcRequest(network, "broadcast_tx_commit", [base64Tx]);
         return result;
     }
@@ -2486,7 +2529,7 @@ class LedgerWallet {
             const signature = await showLedgerApprovalUI(
                 "Approve Transaction",
                 "Please review and approve the transaction on your Ledger device.",
-                () => sign(dataWithPrefix, derivationPath),
+                (onProgress) => sign(dataWithPrefix, derivationPath, onProgress),
                 true,
             );
 
@@ -2496,7 +2539,7 @@ class LedgerWallet {
             signedDelegateBytes[daBytes.length] = 0; // ed25519
             signedDelegateBytes.set(signature.subarray(0, 64), daBytes.length + 1);
 
-            signedDelegateActions.push(btoa(String.fromCharCode(...signedDelegateBytes)));
+            signedDelegateActions.push(bytesToBase64(signedDelegateBytes));
         }
         return { signedDelegateActions };
     }
@@ -2517,11 +2560,11 @@ class LedgerWallet {
         const signature = await showLedgerApprovalUI(
             "Sign Message",
             "Please review and approve the message signing on your Ledger device.",
-            () => sign(dataWithPrefix, derivationPath),
+            (onProgress) => sign(dataWithPrefix, derivationPath, onProgress),
             true,
         );
 
-        const signatureBase64 = btoa(String.fromCharCode(...signature));
+        const signatureBase64 = bytesToBase64(signature);
         return {
             accountId: accounts[0].accountId,
             publicKey: accounts[0].publicKey,
