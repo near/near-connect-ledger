@@ -60,7 +60,6 @@ To register this executor with near-connect, add the following entry to your wal
   "version": "1.0.0",
   "executor": "/path/to/ledger-executor.js",
   "type": "sandbox",
-  "keepAlive": true,
   "platform": {},
   "features": {
     "signMessage": true,
@@ -77,24 +76,25 @@ To register this executor with near-connect, add the following entry to your wal
     "storage": true,
     "usb": true,
     "hid": true,
-    "bluetooth": true
+    "bluetooth": true,
+    "keepAlive": true
   }
 }
 ```
 
-### `keepAlive`
+### `permissions.keepAlive`
 
 near-connect normally creates a fresh sandbox iframe for every wallet call and
 destroys it afterwards, which drops the device connection each time. Over
 Web Bluetooth that means the device chooser on every request (an opaque-origin
 sandbox can't use `navigator.bluetooth.getDevices()`). With `"keepAlive": true`
-(supported by near-connect builds that include it) the iframe stays alive,
-hidden, between calls, so the connection — and the remembered Bluetooth
+in `permissions` (supported by near-connect builds that include it) the iframe
+stays alive, hidden, between calls, so the connection — and the remembered Bluetooth
 device — persist until sign-out. If the link drops (the Ledger sleeps or goes
 out of range), the executor reconnects to the remembered device with
 `gatt.connect()`, without the chooser.
 
-The flag is read from this wallet's entry in near-connect's wallet manifest
+The permission is read from this wallet's entry in near-connect's wallet manifest
 (`repository/manifest.json` in near-connect), not from this repository.
 
 A lost Bluetooth link can look connected: after the Ledger locks or sleeps,
