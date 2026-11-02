@@ -102,6 +102,24 @@ writes fail with errors such as "GATT Service no longer exists". The executor
 then drops the session, asks the user to unlock the Ledger and open the NEAR
 app, and reconnects before the next attempt (Try Again).
 
+### Entering an account manually
+
+A typed account ID is checked against the
+[account ID rules](https://nomicon.io/DataStructures/Account) before any
+network call (2–64 characters; lowercase letters, digits and `.` `-` `_`
+separators, never doubled or at the ends). Spaces around it and capital
+letters are tolerated.
+
+If the account doesn't exist, mainnet users can create a new account for this
+Ledger. New accounts are always `<name>.near`, one level under `near`: the
+name is entered with a fixed `.near` suffix, and dotted names such as
+`qq.frol.near` are refused, because only the owner of `frol.near` can create
+accounts under it. The name is checked for availability before creation. On
+testnet there is no creation offer.
+
+Every error says what to do next: fix the ID, choose another name, check the
+connection and retry, or go back and pick another account.
+
 ### Review timeout
 
 APDU responses are awaited for up to 7 minutes (`DEVICE_REVIEW_TIMEOUT_MS`):

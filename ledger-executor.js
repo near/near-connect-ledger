@@ -1178,6 +1178,9 @@ const LEDGER_STYLES = `
   transition:border-color 120ms ease, box-shadow 120ms ease;
 }
 .lc-input::placeholder { color:var(--lc-subtle); }
+.lc-input-suffix { display:flex; align-items:center; gap:8px; }
+.lc-input-suffix .lc-input { flex:1; min-width:0; }
+.lc-suffix { font-size:15px; font-weight:500; color:var(--lc-muted); }
 .lc-input:focus { border-color:#d4d4d8; box-shadow:0 0 0 3px rgba(212,212,216,0.16); }
 .lc-input.is-invalid { border-color:var(--lc-danger); }
 .lc-input.is-invalid:focus { box-shadow:0 0 0 3px rgba(248,113,113,0.2); }
@@ -1903,10 +1906,108 @@ async function promptForDerivationPath(currentPath = DEFAULT_DERIVATION_PATH) {
 }
 
 // ============================================================================
+// Account ID Validation
+// ============================================================================
+
+// https://nomicon.io/DataStructures/Account#account-id-rules
+const ACCOUNT_ID_MIN_LENGTH = 2;
+const ACCOUNT_ID_MAX_LENGTH = 64;
+const ACCOUNT_ID_PATTERN = /^(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$/;
+// New accounts are created as `<name>.near` (mainnet only): one level under
+// `near`, since nobody else's sub-accounts can be created on the user's behalf.
+const NEW_ACCOUNT_SUFFIX = ".near";
+const NEW_ACCOUNT_NETWORK = "mainnet";
+
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+/** Account IDs are lowercase; tolerate stray spaces and capitals in what was typed. */
+function normalizeAccountIdInput(value) {
+    return (value || "").trim().toLowerCase();
+}
+
+/**
+ * Why `accountId` can't be a NEAR account ID, as a plain-language message
+ * saying what to change (HTML-safe), or null when it's valid.
+ */
+function accountIdProblem(accountId) {
+    if (!accountId) return "Enter your NEAR account ID, for example <strong>alice.near</strong>.";
+    if (/\s/.test(accountId)) return "Account IDs can't contain spaces. Remove them and try again.";
+    const invalidChars = [...new Set(accountId.replace(/[a-z0-9._-]/g, ""))];
+    if (invalidChars.length > 0) {
+        const list = invalidChars.map(c => `<strong>${escapeHtml(c)}</strong>`).join(" ");
+        return `Account IDs can only use lowercase letters (a–z), digits (0–9), and the separators <strong>.</strong> <strong>-</strong> <strong>_</strong>. Remove ${list} and try again.`;
+    }
+    if (accountId.length < ACCOUNT_ID_MIN_LENGTH) return "That's too short: account IDs have at least 2 characters.";
+    if (accountId.length > ACCOUNT_ID_MAX_LENGTH) {
+        return `That's too long: account IDs have at most 64 characters, and this one has ${accountId.length}.`;
+    }
+    if (!ACCOUNT_ID_PATTERN.test(accountId)) {
+        return "A dot, dash or underscore can't be at the start or end of an account ID, or right next to another one (like <strong>..</strong> or <strong>-.</strong>). Fix that and try again.";
+    }
+    return null;
+}
+
+/** 64-hex NEAR implicit or 0x-prefixed Ethereum-style implicit account ID. */
+function isImplicitAccountId(accountId) {
+    return /^[0-9a-f]{64}$/.test(accountId) || /^0x[0-9a-f]{40}$/.test(accountId);
+}
+
+/**
+ * The `<name>` for a new `<name>.near` account suggested by what was typed:
+ * `alice` for "alice" or "alice.near"; empty when there's no sensible
+ * suggestion (sub-accounts such as "qq.alice.near", other suffixes, implicit IDs).
+ */
+function suggestedNewAccountName(accountId) {
+    if (isImplicitAccountId(accountId)) return "";
+    if (!accountId.includes(".")) return accountId;
+    const labels = accountId.split(".");
+    return labels.length === 2 && `.${labels[1]}` === NEW_ACCOUNT_SUFFIX ? labels[0] : "";
+}
+
+/**
+ * Why `name` can't be used for a new `<name>.near` account (HTML-safe
+ * message), or null when it can. A trailing ".near" is ignored.
+ */
+function newAccountNameProblem(name) {
+    if (!name) return "Enter a name for your new account, for example <strong>alice</strong> for alice.near.";
+    if (name.includes(".")) {
+        return "Use a single name without dots, for example <strong>alice</strong> for alice.near. Accounts like <strong>team.alice.near</strong> can only be created by the owner of alice.near.";
+    }
+    const problem = accountIdProblem(name + NEW_ACCOUNT_SUFFIX);
+    if (problem && name.length + NEW_ACCOUNT_SUFFIX.length > ACCOUNT_ID_MAX_LENGTH) {
+        return `That name is too long: it can have at most ${ACCOUNT_ID_MAX_LENGTH - NEW_ACCOUNT_SUFFIX.length} characters before .near.`;
+    }
+    return problem;
+}
+
+/** Strip a typed ".near" so "alice.near" and "alice" both mean alice.near. */
+function newAccountNameFromInput(value) {
+    const name = normalizeAccountIdInput(value);
+    return name.endsWith(NEW_ACCOUNT_SUFFIX) ? name.slice(0, -NEW_ACCOUNT_SUFFIX.length) : name;
+}
+
+/** An error whose message is already written for the user (HTML-safe). */
+function userError(message, code) {
+    const err = new Error(message);
+    err.userFacing = true;
+    if (code) err.code = code;
+    return err;
+}
+
+/** What to show for an error from checking an account: its own words, or a retry hint. */
+function accountCheckMessage(error, accountId) {
+    if (error?.userFacing) return error.message;
+    console.log("[Ledger] account check failed:", error);
+    return `Couldn't check <strong>${escapeHtml(accountId)}</strong> right now. Check your internet connection and try again.`;
+}
+
+// ============================================================================
 // Account ID Input UI
 // ============================================================================
 
-async function promptForAccountId(foundAccounts = [], implicitAccountId = "", onVerify = null, onCreateAccount = null, hideOnSuccess = true) {
+async function promptForAccountId(foundAccounts = [], implicitAccountId = "", onVerify = null, onCreateAccount = null, hideOnSuccess = true, network = "mainnet") {
     ensureLedgerStyles();
     await window.selector.ui.showIframe();
     const root = document.getElementById("root");
@@ -1945,7 +2046,7 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
 
         const manualField = `
               <label for="accountIdInput" class="lc-field-label">Account ID</label>
-              <input type="text" id="accountIdInput" placeholder="example.near" autocapitalize="off" autocorrect="off" spellcheck="false" value="${currentValue}"
+              <input type="text" id="accountIdInput" placeholder="example.near" autocapitalize="off" autocorrect="off" spellcheck="false" value="${escapeHtml(currentValue)}"
                 class="lc-input${errorMessage ? " is-invalid" : ""}"${errorMessage ? ' aria-invalid="true"' : ""} />
               ${errorMessage ? alertBox(errorMessage) : ""}`;
 
@@ -2008,6 +2109,42 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
     renderUI();
 
     return new Promise((resolve, reject) => {
+        function finish(accountId) {
+            if (hideOnSuccess) {
+                root.innerHTML = "";
+                root.style.display = "none";
+                window.selector.ui.hideIframe();
+            }
+            resolve(accountId);
+        }
+
+        /**
+         * Verify `accountId`; if it doesn't exist, offer to create a new
+         * `name.near` (mainnet only). Re-renders the picker with a message
+         * saying what to do when that doesn't work out.
+         */
+        async function tryAccount(accountId, manualValue) {
+            const showManual = manualValue !== null;
+            if (!onVerify) return finish(accountId);
+            try {
+                await onVerify(accountId);
+                return finish(accountId);
+            } catch (error) {
+                if (error?.code !== "ACCOUNT_CREATION_REQUIRED") {
+                    renderUI(accountCheckMessage(error, accountId), manualValue ?? "", showManual);
+                    return setupListeners();
+                }
+                if (!onCreateAccount || network !== NEW_ACCOUNT_NETWORK) {
+                    renderUI(`There's no account called <strong>${escapeHtml(accountId)}</strong> on ${escapeHtml(network)}. Check the spelling, or create the account first, then try again.`, manualValue ?? "", showManual);
+                    return setupListeners();
+                }
+                const created = await promptForCreateAccount(accountId, network, onCreateAccount);
+                if (created) return finish(created);
+                renderUI(null, manualValue ?? "", showManual);
+                setupListeners();
+            }
+        }
+
         function selectAccount(accountId) {
             return async () => {
                 // Busy state on the picked row (spinner + "Checking…"); the other
@@ -2026,48 +2163,7 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
                 if (confirmBtn) confirmBtn.disabled = true;
                 const showManualBtn = document.getElementById("showManualBtn");
                 if (showManualBtn) showManualBtn.disabled = true;
-
-                if (onVerify) {
-                    try {
-                        await onVerify(accountId);
-                        if (hideOnSuccess) {
-                            root.innerHTML = "";
-                            root.style.display = "none";
-                            window.selector.ui.hideIframe();
-                        }
-                        resolve(accountId);
-                    } catch (error) {
-                        if (error?.code === "ACCOUNT_CREATION_REQUIRED" && onCreateAccount) {
-                            try {
-                                const created = await promptForCreateAccount(accountId, error.message, onCreateAccount);
-                                if (created) {
-                                    if (hideOnSuccess) {
-                                        root.innerHTML = "";
-                                        root.style.display = "none";
-                                        window.selector.ui.hideIframe();
-                                    }
-                                    resolve(accountId);
-                                    return;
-                                }
-                                renderUI(null, "", false);
-                                setupListeners();
-                            } catch (createError) {
-                                renderUI(createError.message, "", false);
-                                setupListeners();
-                            }
-                        } else {
-                            renderUI(error.message, "", false);
-                            setupListeners();
-                        }
-                    }
-                } else {
-                    if (hideOnSuccess) {
-                        root.innerHTML = "";
-                        root.style.display = "none";
-                        window.selector.ui.hideIframe();
-                    }
-                    resolve(accountId);
-                }
+                await tryAccount(accountId, null);
             };
         }
 
@@ -2097,58 +2193,26 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
                 });
             }
 
-            // Manual input confirm
+            // Manual input confirm: catch typos before asking the network.
             const confirmBtn = document.getElementById("confirmBtn");
             const input = document.getElementById("accountIdInput");
             if (confirmBtn && input) {
                 confirmBtn.addEventListener("click", async () => {
-                    const accountId = input.value.trim();
-                    if (!accountId) return;
-                    if (onVerify) {
-                        setButtonLoading(confirmBtn, "Verifying…");
-                        input.disabled = true;
-                        if (showManualBtn) showManualBtn.disabled = true;
-                        document.querySelectorAll(".accountBtn").forEach(btn => { btn.disabled = true; });
-                        try {
-                            await onVerify(accountId);
-                            if (hideOnSuccess) {
-                                root.innerHTML = "";
-                                root.style.display = "none";
-                                window.selector.ui.hideIframe();
-                            }
-                            resolve(accountId);
-                        } catch (error) {
-                            if (error?.code === "ACCOUNT_CREATION_REQUIRED" && onCreateAccount) {
-                                try {
-                                    const created = await promptForCreateAccount(accountId, error.message, onCreateAccount);
-                                    if (created) {
-                                        if (hideOnSuccess) {
-                                            root.innerHTML = "";
-                                            root.style.display = "none";
-                                            window.selector.ui.hideIframe();
-                                        }
-                                        resolve(accountId);
-                                        return;
-                                    }
-                                    renderUI(null, accountId, true);
-                                    setupListeners();
-                                } catch (createError) {
-                                    renderUI(createError.message, accountId, true);
-                                    setupListeners();
-                                }
-                            } else {
-                                renderUI(error.message, accountId, true);
-                                setupListeners();
-                            }
-                        }
-                    } else {
-                        if (hideOnSuccess) {
-                            root.innerHTML = "";
-                            root.style.display = "none";
-                            window.selector.ui.hideIframe();
-                        }
-                        resolve(accountId);
+                    const typed = input.value;
+                    const accountId = normalizeAccountIdInput(typed);
+                    const problem = accountIdProblem(accountId);
+                    if (problem) {
+                        manualDraft = typed;
+                        renderUI(problem, typed, true);
+                        return setupListeners();
                     }
+                    manualDraft = accountId;
+                    setButtonLoading(confirmBtn, "Verifying…");
+                    input.value = accountId;
+                    input.disabled = true;
+                    if (showManualBtn) showManualBtn.disabled = true;
+                    document.querySelectorAll(".accountBtn").forEach(btn => { btn.disabled = true; });
+                    await tryAccount(accountId, accountId);
                 });
                 input.addEventListener("keypress", e => {
                     if (e.key === "Enter") confirmBtn.click();
@@ -2197,9 +2261,10 @@ function isImplicitAccountOf(accountId, publicKey) {
 }
 
 function accountCreationRequired(accountId) {
-    const err = new Error(`Account ${accountId} does not exist yet.`);
-    err.code = "ACCOUNT_CREATION_REQUIRED";
-    return err;
+    return userError(
+        `There's no account called <strong>${escapeHtml(accountId)}</strong>. Check the spelling and try again.`,
+        "ACCOUNT_CREATION_REQUIRED",
+    );
 }
 
 /**
@@ -2227,14 +2292,14 @@ async function verifyAccessKey(network, accountId, publicKey) {
         if (!isUnknownAccountError(error)) {
             if (!isUnknownAccessKeyError(error)) throw error;
             if (await accountExists(network, accountId)) {
-                throw new Error(`Access key not found for account ${accountId}. Please make sure the Ledger public key is registered for this account.`);
+                throw userError(`This Ledger isn't linked to <strong>${escapeHtml(accountId)}</strong>. Check that it's the right account, or first add this Ledger's key to it (for example, in the wallet you use for that account), then try again.`);
             }
         }
         if (isImplicitAccountOf(accountId, publicKey)) return true;
         throw accountCreationRequired(accountId);
     }
     if (accessKey.permission !== "FullAccess") {
-        throw new Error("The public key does not have FullAccess permission for this account.");
+        throw userError(`This Ledger only has limited access to <strong>${escapeHtml(accountId)}</strong>, so it can't sign for it. Add the Ledger as a full-access key to that account, or choose another account.`);
     }
     return true;
 }
@@ -2244,48 +2309,73 @@ async function verifyAccessKey(network, accountId, publicKey) {
 // ============================================================================
 
 async function createUserAccountViaApi(accountId, publicKey) {
-    const response = await fetch("https://api.trezu.app/api/user/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountId, publicKey }),
-    });
-
-    let body = null;
-    try { body = await response.json(); } catch { }
-
-    if (!response.ok) {
-        const message =
-            body?.error ||
-            body?.message ||
-            (typeof body === "string" ? body : null) ||
-            "Failed to create account. Please try again.";
-        throw new Error(message);
+    const shown = `<strong>${escapeHtml(accountId)}</strong>`;
+    let response;
+    try {
+        response = await fetch("https://api.trezu.app/api/user/create", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ accountId, publicKey }),
+        });
+    } catch (error) {
+        console.log("[Ledger] account creation request failed:", error);
+        throw userError("Couldn't reach the account service. Check your internet connection and try again.");
     }
+    if (response.ok) return await response.json().catch(() => null);
 
-    return body;
+    // The service answers errors in plain text; keep it for debugging only.
+    console.log("[Ledger] account creation failed:", response.status, await response.text().catch(() => ""));
+    if (response.status === 409) throw userError(`${shown} is already taken. Try a different name.`);
+    if (response.status === 400 || response.status === 422) throw userError(`${shown} can't be created. Try a different name.`);
+    if (response.status === 429) throw userError("Too many attempts. Wait a minute, then try again.");
+    throw userError(`Couldn't create ${shown} right now. Wait a minute, then try again.`);
 }
 
-async function promptForCreateAccount(accountId, reasonMessage, onCreateAccount) {
+/**
+ * Offer to create a new `<name>.near` account for this Ledger after
+ * `requestedId` turned out not to exist. Resolves with the created account ID,
+ * or null when the user goes back.
+ */
+async function promptForCreateAccount(requestedId, network, onCreateAccount) {
     ensureLedgerStyles();
     const root = document.getElementById("root");
     root.style.display = "flex";
 
-    function renderUI(errorMessage = null) {
-        const alertMessage = errorMessage || reasonMessage;
+    const requested = `<strong class="lc-em">${escapeHtml(requestedId)}</strong>`;
+    const suggestion = suggestedNewAccountName(requestedId);
+    let intro;
+    if (suggestion && requestedId === suggestion + NEW_ACCOUNT_SUFFIX) {
+        intro = `There's no account called ${requested} yet. You can create it now, controlled by this Ledger.`;
+    } else if (suggestion) {
+        intro = `There's no account called ${requested}. New accounts end in <strong>.near</strong>: you can create <strong class="lc-em">${escapeHtml(suggestion + NEW_ACCOUNT_SUFFIX)}</strong>, controlled by this Ledger.`;
+    } else if (isImplicitAccountId(requestedId)) {
+        intro = `${requested} is a key-based address that doesn't belong to this Ledger, so it can't be used here. You can create a new account with a name instead.`;
+    } else if (requestedId.endsWith(NEW_ACCOUNT_SUFFIX)) {
+        const parent = requestedId.slice(requestedId.indexOf(".") + 1);
+        intro = `There's no account called ${requested}, and it can't be created here: only the owner of <strong>${escapeHtml(parent)}</strong> can create accounts under it. You can create a new <strong>name.near</strong> account instead.`;
+    } else {
+        intro = `There's no account called ${requested}. New accounts can only end in <strong>.near</strong>: you can create a new <strong>name.near</strong> account instead.`;
+    }
+
+    function renderUI(errorMessage = null, value = suggestion) {
         root.innerHTML = `
         <div class="lc-screen">
           <div class="lc-body">
             <div class="lc-header">
-              <span class="lc-title">Account Doesn't Exist</span>
-              <p class="lc-text lc-break">
-                The account <strong class="lc-em">${accountId}</strong> does not exist on NEAR blockchain. Do you want to create it now?
-              </p>
+              <span class="lc-title">Create a New Account</span>
+              <p class="lc-text lc-break">${intro}</p>
             </div>
             <div class="lc-stack">
-              ${alertMessage ? alertBox(alertMessage) : ""}
+              <label for="newAccountInput" class="lc-field-label">New account name</label>
+              <div class="lc-input-suffix">
+                <input type="text" id="newAccountInput" placeholder="alice" autocapitalize="off" autocorrect="off" spellcheck="false"
+                  value="${escapeHtml(value)}" class="lc-input${errorMessage ? " is-invalid" : ""}"${errorMessage ? ' aria-invalid="true"' : ""} aria-describedby="newAccountSuffix" />
+                <span id="newAccountSuffix" class="lc-suffix">${NEW_ACCOUNT_SUFFIX}</span>
+              </div>
+              ${errorMessage ? alertBox(errorMessage) : ""}
               <div class="lc-actions">
                 <button id="createAccountConfirmBtn" class="lc-btn lc-btn-primary">Create Account</button>
-                <button id="createAccountCancelBtn" class="lc-btn lc-btn-secondary">Cancel</button>
+                <button id="createAccountCancelBtn" class="lc-btn lc-btn-secondary">Back</button>
               </div>
             </div>
           </div>
@@ -2294,31 +2384,56 @@ async function promptForCreateAccount(accountId, reasonMessage, onCreateAccount)
 
     renderUI();
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
         function setupListeners() {
             const cancelBtn = document.getElementById("createAccountCancelBtn");
             const createBtn = document.getElementById("createAccountConfirmBtn");
+            const input = document.getElementById("newAccountInput");
 
-            cancelBtn.addEventListener("click", () => { resolve(false); });
+            cancelBtn.addEventListener("click", () => resolve(null));
+            input.addEventListener("keypress", e => { if (e.key === "Enter") createBtn.click(); });
+            setTimeout(() => input.focus(), 100);
 
             createBtn.addEventListener("click", async () => {
-                setButtonLoading(createBtn, "Creating account…");
+                const typed = input.value;
+                const name = newAccountNameFromInput(typed);
+                const problem = newAccountNameProblem(name);
+                if (problem) {
+                    renderUI(problem, typed);
+                    setupListeners();
+                    return;
+                }
+                const accountId = name + NEW_ACCOUNT_SUFFIX;
+                const shown = `<strong>${escapeHtml(accountId)}</strong>`;
+
+                setButtonLoading(createBtn, "Checking name…");
                 cancelBtn.disabled = true;
+                input.disabled = true;
+                try {
+                    if (await accountExists(network, accountId)) {
+                        renderUI(`${shown} is already taken. If it's yours, go Back and enter it as your account. Otherwise, try a different name.`, typed);
+                        setupListeners();
+                        return;
+                    }
+                } catch (error) {
+                    console.log("[Ledger] availability check failed:", error);
+                    renderUI(`Couldn't check whether ${shown} is available. Check your internet connection and try again.`, typed);
+                    setupListeners();
+                    return;
+                }
+
+                setButtonLoading(createBtn, "Creating account…");
                 try {
                     await onCreateAccount(accountId);
-                    resolve(true);
+                    resolve(accountId);
                 } catch (error) {
-                    renderUI(error.message || "Failed to create account.");
+                    renderUI(error?.userFacing ? error.message : `Couldn't create ${shown}. Try again.`, typed);
                     setupListeners();
                 }
             });
         }
 
-        try {
-            setupListeners();
-        } catch (error) {
-            reject(error);
-        }
+        setupListeners();
     });
 }
 
@@ -2803,7 +2918,7 @@ class LedgerWallet {
             await createUserAccountViaApi(accountId, publicKey);
         };
 
-        const accountId = await promptForAccountId(foundAccounts, implicitAccountId, verifyAccount, createUserAccount, false);
+        const accountId = await promptForAccountId(foundAccounts, implicitAccountId, verifyAccount, createUserAccount, false, network);
 
         const accounts = [{ accountId, publicKey }];
         await window.selector.storage.set(STORAGE_KEY_ACCOUNTS, JSON.stringify(accounts));
