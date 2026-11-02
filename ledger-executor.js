@@ -544,6 +544,29 @@ function _bleOnDisconnected() {
     }
 }
 
+/**
+ * Web Bluetooth errors meaning the GATT link is gone or stale: the Ledger
+ * locked, slept or went out of range. The browser may still report
+ * `gatt.connected`, so the session has to be dropped explicitly.
+ */
+function isBleLinkError(error) {
+    const msg = error?.message || "";
+    return error?.name === "NetworkError"
+        || error?.name === "InvalidStateError"
+        || /GATT|no longer exists|BLE device not connected/i.test(msg);
+}
+
+/** Error shown when the Bluetooth link to the Ledger is lost. */
+const BLE_LINK_LOST_MESSAGE = "Lost the Bluetooth connection to your Ledger.";
+
+/** Forget the current GATT session (not the device) so the next call reconnects. */
+function bleDropSession() {
+    const device = _bleDevice || _bleKnownDevice;
+    if (_bleNotifyChar) _bleNotifyChar.removeEventListener("characteristicvaluechanged", _bleOnNotification);
+    _bleOnDisconnected();
+    try { if (device?.gatt?.connected) device.gatt.disconnect(); } catch { }
+}
+
 /** Open (or re-open) GATT to the remembered device; throws if that isn't possible. */
 async function bleReconnectKnownDevice() {
     if (!_bleKnownDevice) throw new Error("No remembered Ledger Bluetooth device");
@@ -572,7 +595,14 @@ async function transportExchange(apdu) {
         return await hidExchange(apdu);
     }
     if (_activeTransportMode === TRANSPORT_WEB_BLE) {
-        return await bleExchange(apdu);
+        try {
+            return await bleExchange(apdu);
+        } catch (error) {
+            if (!isBleLinkError(error)) throw error;
+            console.log("[BLE] link lost during exchange:", error.message);
+            bleDropSession();
+            throw new Error(BLE_LINK_LOST_MESSAGE);
+        }
     }
     if (_activeTransportMode === TRANSPORT_NATIVE_BLE) {
         const response = await nativeBLE("exchange", { command: Array.from(apdu) }, DEVICE_REVIEW_TIMEOUT_MS);
@@ -1005,6 +1035,7 @@ function getLedgerErrorMessage(error) {
     if (msg.includes("No device selected") || msg.includes("No Ledger device found") || msg.includes("No Ledger device selected")) return "No Ledger device was found. Please make sure your Ledger is connected and try again.";
     if (msg.includes("0x6985")) return "You declined the request on the Ledger device.";
     if (msg.includes("0x6e01") || msg.includes("0x6d02")) return "Please unlock your Ledger device and open the NEAR app.";
+    if (msg === BLE_LINK_LOST_MESSAGE || isBleLinkError(error)) return "Your Ledger isn't responding over Bluetooth. Unlock it, open the NEAR app, keep it nearby, and try again.";
     if (msg.includes("MTU negotiation timed out") || msg.includes("BLE response timed out")) return "Unable to communicate with the Ledger device over Bluetooth. Please make sure the device is unlocked and nearby, then try again.";
     if (error.name === "NotFoundError" || msg.includes("User cancelled")) return "No Ledger device was selected.";
     if (msg.includes("is blocked") || error.name === "SecurityError") return msg;
@@ -1436,6 +1467,20 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
 
     while (true) {
         ensureLedgerStyles();
+        try {
+            // A retry after a lost connection needs a fresh link first.
+            if (!(await transportIsConnected())) await reconnectLedger();
+        } catch (error) {
+            if (error.message !== "User cancelled") {
+                renderErrorUI(error);
+                const action = await waitForRetryAction();
+                if (action === "retry") continue;
+            }
+            root.innerHTML = "";
+            root.style.display = "none";
+            window.selector.ui.hideIframe();
+            throw new Error("User cancelled");
+        }
         renderLoadingUI();
         try {
             const result = await asyncOperation(reportProgress);
@@ -2567,6 +2612,138 @@ function buildNep413Payload(message, recipient, nonce) {
 // Wallet Implementation
 // ============================================================================
 
+/**
+ * Re-open the transport used at sign-in and the NEAR app: silently when
+ * possible (USB, native BLE, the remembered Bluetooth device), otherwise via
+ * a Connect button that provides the user gesture the chooser needs.
+ */
+async function reconnectLedger() {
+    if (await transportIsConnected()) return;
+
+    const storedMode = await window.selector.storage.get(STORAGE_KEY_TRANSPORT_MODE);
+    if (!storedMode) throw new Error("Ledger is not connected. Please sign in with Ledger first.");
+
+    ensureLedgerStyles();
+    const openingNearApp = () => showStatusScreen(
+        "Reconnect Ledger",
+        "If asked, approve opening the NEAR app on your Ledger device.",
+        "device",
+    );
+
+    // WebUSB can reconnect silently via getDevices() — no user gesture needed
+    if ((storedMode === TRANSPORT_WEB_USB || storedMode === TRANSPORT_WEB_HID) && isWebUsbSupported()) {
+        try {
+            const devices = await navigator.usb.getDevices();
+            const device = devices.find(d => d.vendorId === LEDGER_VENDOR_ID);
+            if (device) {
+                await showStatusScreen("Reconnect Ledger", "Connecting to your Ledger device…");
+                await usbOpen(device);
+                _activeTransport = _usbDevice;
+                _activeTransportMode = TRANSPORT_WEB_USB;
+                await openingNearApp();
+                await openNearApplication();
+                await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
+                return;
+            }
+        } catch {
+            // WebUSB silent reconnect failed — fall through to manual reconnect
+        }
+    }
+
+    // Native BLE can reconnect silently — the native side persists the connection across iframe lifecycles
+    if (storedMode === TRANSPORT_NATIVE_BLE) {
+        try {
+            await showStatusScreen("Reconnect Ledger", "Connecting to your Ledger device…");
+            await transportConnect(TRANSPORT_NATIVE_BLE);
+            await openingNearApp();
+            await openNearApplication();
+            await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
+            return;
+        } catch {
+            // Native BLE reconnect failed — fall through to manual reconnect
+        }
+    }
+
+    // Web Bluetooth: the device picked earlier can reconnect without the chooser.
+    if (storedMode === TRANSPORT_WEB_BLE && _bleKnownDevice) {
+        try {
+            await showStatusScreen("Reconnect Ledger", "Reconnecting to your Ledger over Bluetooth…");
+            await bleReconnectKnownDevice();
+            await openingNearApp();
+            await openNearApplication();
+            await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
+            return;
+        } catch {
+            // Out of range / asleep / unpaired — fall through to the Connect button.
+        }
+    }
+
+    // Web BLE and HID require requestDevice() which needs a user gesture.
+    // Show a "Connect" button so the click provides the gesture context.
+    await window.selector.ui.showIframe();
+    const root = document.getElementById("root");
+    root.style.display = "flex";
+
+    await new Promise((resolve, reject) => {
+        function renderConnectButton(errorMessage) {
+            root.innerHTML = `
+            <div class="lc-screen">
+              <div class="lc-body">
+                <div class="lc-header">
+                  <div class="lc-title-row">
+                    <span class="lc-title">Reconnect Ledger</span>
+                    <button id="reconnectCancelBtn" class="lc-icon-btn" aria-label="Close">
+                      <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1L13 13M13 1L1 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+                    </button>
+                  </div>
+                  <p class="lc-text">
+                    Please make sure your Ledger device is ${(storedMode === TRANSPORT_WEB_BLE || storedMode === TRANSPORT_NATIVE_BLE) ? "nearby and Bluetooth is enabled" : "connected via USB"}.
+                  </p>
+                </div>
+                ${errorMessage ? alertBox(errorMessage) : ""}
+                <div class="lc-actions">
+                  <button id="reconnectBtn" class="lc-btn lc-btn-primary">Connect</button>
+                </div>
+              </div>
+            </div>`;
+
+            document.getElementById("reconnectBtn").addEventListener("click", async () => {
+                root.innerHTML = `
+                <div class="lc-screen">
+                  <div class="lc-body">
+                    <div class="lc-header">
+                      <span class="lc-title">Reconnect Ledger</span>
+                      <p class="lc-text">Connecting to your Ledger device…</p>
+                    </div>
+                    ${spinnerHtml()}
+                  </div>
+                </div>`;
+                try {
+                    if (!(await transportIsConnected())) {
+                        await transportConnect(storedMode);
+                    }
+                    await openingNearApp();
+                    await openNearApplication();
+                    await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
+                    resolve();
+                } catch (error) {
+                    const errorMsg = getLedgerErrorMessage(error);
+                    renderConnectButton(errorMsg);
+                }
+            });
+
+            document.getElementById("reconnectCancelBtn").addEventListener("click", () => {
+                root.innerHTML = "";
+                root.style.display = "none";
+                window.selector.ui.hideIframe();
+                reject(new Error("User cancelled"));
+            });
+        }
+
+        renderConnectButton(null);
+    });
+}
+
 class LedgerWallet {
     async getDerivationPath() {
         const path = await window.selector.storage.get(STORAGE_KEY_DERIVATION_PATH);
@@ -2574,130 +2751,7 @@ class LedgerWallet {
     }
 
     async _reconnectForSigning() {
-        if (await transportIsConnected()) return;
-
-        const storedMode = await window.selector.storage.get(STORAGE_KEY_TRANSPORT_MODE);
-        if (!storedMode) throw new Error("Ledger is not connected. Please sign in with Ledger first.");
-
-        ensureLedgerStyles();
-        const openingNearApp = () => showStatusScreen(
-            "Reconnect Ledger",
-            "If asked, approve opening the NEAR app on your Ledger device.",
-            "device",
-        );
-
-        // WebUSB can reconnect silently via getDevices() — no user gesture needed
-        if ((storedMode === TRANSPORT_WEB_USB || storedMode === TRANSPORT_WEB_HID) && isWebUsbSupported()) {
-            try {
-                const devices = await navigator.usb.getDevices();
-                const device = devices.find(d => d.vendorId === LEDGER_VENDOR_ID);
-                if (device) {
-                    await showStatusScreen("Reconnect Ledger", "Connecting to your Ledger device…");
-                    await usbOpen(device);
-                    _activeTransport = _usbDevice;
-                    _activeTransportMode = TRANSPORT_WEB_USB;
-                    await openingNearApp();
-                    await openNearApplication();
-                    await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
-                    return;
-                }
-            } catch {
-                // WebUSB silent reconnect failed — fall through to manual reconnect
-            }
-        }
-
-        // Native BLE can reconnect silently — the native side persists the connection across iframe lifecycles
-        if (storedMode === TRANSPORT_NATIVE_BLE) {
-            try {
-                await showStatusScreen("Reconnect Ledger", "Connecting to your Ledger device…");
-                await transportConnect(TRANSPORT_NATIVE_BLE);
-                await openingNearApp();
-                await openNearApplication();
-                await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
-                return;
-            } catch {
-                // Native BLE reconnect failed — fall through to manual reconnect
-            }
-        }
-
-        // Web Bluetooth: the device picked earlier can reconnect without the chooser.
-        if (storedMode === TRANSPORT_WEB_BLE && _bleKnownDevice) {
-            try {
-                await showStatusScreen("Reconnect Ledger", "Reconnecting to your Ledger over Bluetooth…");
-                await bleReconnectKnownDevice();
-                await openingNearApp();
-                await openNearApplication();
-                await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
-                return;
-            } catch {
-                // Out of range / asleep / unpaired — fall through to the Connect button.
-            }
-        }
-
-        // Web BLE and HID require requestDevice() which needs a user gesture.
-        // Show a "Connect" button so the click provides the gesture context.
-        await window.selector.ui.showIframe();
-        const root = document.getElementById("root");
-        root.style.display = "flex";
-
-        await new Promise((resolve, reject) => {
-            function renderConnectButton(errorMessage) {
-                root.innerHTML = `
-                <div class="lc-screen">
-                  <div class="lc-body">
-                    <div class="lc-header">
-                      <div class="lc-title-row">
-                        <span class="lc-title">Reconnect Ledger</span>
-                        <button id="reconnectCancelBtn" class="lc-icon-btn" aria-label="Close">
-                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1L13 13M13 1L1 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-                        </button>
-                      </div>
-                      <p class="lc-text">
-                        Please make sure your Ledger device is ${(storedMode === TRANSPORT_WEB_BLE || storedMode === TRANSPORT_NATIVE_BLE) ? "nearby and Bluetooth is enabled" : "connected via USB"}.
-                      </p>
-                    </div>
-                    ${errorMessage ? alertBox(errorMessage) : ""}
-                    <div class="lc-actions">
-                      <button id="reconnectBtn" class="lc-btn lc-btn-primary">Connect</button>
-                    </div>
-                  </div>
-                </div>`;
-
-                document.getElementById("reconnectBtn").addEventListener("click", async () => {
-                    root.innerHTML = `
-                    <div class="lc-screen">
-                      <div class="lc-body">
-                        <div class="lc-header">
-                          <span class="lc-title">Reconnect Ledger</span>
-                          <p class="lc-text">Connecting to your Ledger device…</p>
-                        </div>
-                        ${spinnerHtml()}
-                      </div>
-                    </div>`;
-                    try {
-                        if (!(await transportIsConnected())) {
-                            await transportConnect(storedMode);
-                        }
-                        await openingNearApp();
-                        await openNearApplication();
-                        await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
-                        resolve();
-                    } catch (error) {
-                        const errorMsg = getLedgerErrorMessage(error);
-                        renderConnectButton(errorMsg);
-                    }
-                });
-
-                document.getElementById("reconnectCancelBtn").addEventListener("click", () => {
-                    root.innerHTML = "";
-                    root.style.display = "none";
-                    window.selector.ui.hideIframe();
-                    reject(new Error("User cancelled"));
-                });
-            }
-
-            renderConnectButton(null);
-        });
+        return await reconnectLedger();
     }
 
     async _ensureReady() {

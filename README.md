@@ -94,6 +94,14 @@ device — persist until sign-out. If the link drops (the Ledger sleeps or goes
 out of range), the executor reconnects to the remembered device with
 `gatt.connect()`, without the chooser.
 
+The flag is read from this wallet's entry in near-connect's wallet manifest
+(`repository/manifest.json` in near-connect), not from this repository.
+
+A lost Bluetooth link can look connected: after the Ledger locks or sleeps,
+writes fail with errors such as "GATT Service no longer exists". The executor
+then drops the session, asks the user to unlock the Ledger and open the NEAR
+app, and reconnects before the next attempt (Try Again).
+
 ### Review timeout
 
 APDU responses are awaited for up to 7 minutes (`DEVICE_REVIEW_TIMEOUT_MS`):
