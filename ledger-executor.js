@@ -1748,17 +1748,14 @@ async function promptForDerivationPath(currentPath = DEFAULT_DERIVATION_PATH) {
     const root = document.getElementById("root");
     root.style.display = "flex";
 
-    const pathOptions = [
-        { label: "Account 1", path: "44'/397'/0'/0'/0'" },
-        { label: "Account 2", path: "44'/397'/0'/0'/1'" },
-        { label: "Account 3", path: "44'/397'/0'/0'/2'" },
-    ];
-
     const customPathPrefix = "44'/397'/0'/0'/";
     const customPathSuffix = "'";
     function buildCustomPath(idx) {
         return `${customPathPrefix}${idx}${customPathSuffix}`;
     }
+
+    // Labels use the HD path index itself so "Account 0" is .../0'.
+    const pathOptions = [0, 1, 2].map(idx => ({ label: `Account ${idx}`, path: buildCustomPath(idx) }));
     function isPresetPath(path) {
         return pathOptions.some(opt => opt.path === path);
     }
