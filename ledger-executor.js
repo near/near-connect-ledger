@@ -1086,6 +1086,8 @@ async function openNearApplication() {
         const msg = error.message || "";
         if (msg.includes("6807")) throw new Error("NEAR application is missing on the Ledger device");
         if (msg.includes("5501")) throw new Error("User declined to open the NEAR app");
+        // Keep the earlier meaning of 0xB005 for the open-app request only.
+        if (msg.includes("0xb005")) throw new Error("UNKNOWN_ERROR: approve opening the NEAR app");
         throw error;
     }
 }
@@ -1142,7 +1144,8 @@ async function lookupAccountsByPublicKey(network, publicKey) {
 function getLedgerErrorMessage(error) {
     const msg = error.message || "";
     if (error.code === LEDGER_DISCONNECTED) return "Your Ledger was disconnected. Reconnect it, unlock it and open the NEAR app, then try again.";
-    if (msg.includes("0xb005") || msg.includes("UNKNOWN_ERROR")) return "Please approve opening the NEAR app on your Ledger device.";
+    if (msg.includes("0xb005")) return "Your Ledger's NEAR app couldn't read this request (error 0xB005). Update the NEAR app in Ledger Live, then try again.";
+    if (msg.includes("UNKNOWN_ERROR")) return "Please approve opening the NEAR app on your Ledger device.";
     if (msg.includes("0x5515") || msg.includes("Locked device")) return "Your Ledger device is locked. Please unlock it and try again.";
     if (msg.includes("6807") || msg.includes("NEAR application is missing")) return "NEAR application is not installed on your Ledger device. Please install it using Ledger Live.";
     if (msg.includes("5501") || msg.includes("declined")) return "You declined to open the NEAR app.";
@@ -1566,6 +1569,7 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
     }
 
     function renderErrorUI(error) {
+        console.warn("[Ledger] request failed:", error);
         const errorMessage = getLedgerErrorMessage(error);
         root.style.display = "flex";
         root.innerHTML = `
@@ -2962,6 +2966,47 @@ function buildDelegateActionBytes(senderId, receiverId, actions, nonce, maxBlock
 /**
  * Build NEP-413 message payload (Borsh serialized).
  */
+// What the NEAR Ledger app can show for each NEP-413 field (bytes; see
+// CappedString in LedgerHQ/app-near). Since app v2.6 a longer field is
+// rejected with 0xB005 unless Blind signing is on in the app's settings
+// (LedgerHQ/app-near#54).
+const NEP413_FIELD_LIMITS = [
+    ["message", 400],
+    ["recipient", 64],
+    ["callback URL", 100],
+];
+
+/** Fields of a NEP-413 message longer than the Ledger can display. */
+function nep413OversizedFields({ message, recipient, callbackUrl }) {
+    const values = { message, recipient, "callback URL": callbackUrl };
+    return NEP413_FIELD_LIMITS
+        .map(([name, limit]) => ({ name, limit, length: new TextEncoder().encode(values[name] ?? "").length }))
+        .filter(field => field.length > field.limit);
+}
+
+function isTxParsingFail(error) {
+    return /0xb005\b/i.test(error?.message || "");
+}
+
+/**
+ * Sign a NEP-413 message, turning the NEAR app's parsing failure (0xB005)
+ * into a message that says why and what to do.
+ */
+async function signNep413(dataWithPrefix, path, onProgress, fields) {
+    try {
+        return await sign(dataWithPrefix, path, onProgress);
+    } catch (error) {
+        if (!isTxParsingFail(error)) throw error;
+        console.warn("[Ledger] NEP-413 message rejected by the device:", error);
+        const oversized = nep413OversizedFields(fields);
+        if (oversized.length) {
+            const which = oversized.map(f => `${f.name} (${f.length} bytes, the Ledger shows up to ${f.limit})`).join(" and ");
+            throw new Error(`This message's ${which} is too long for your Ledger to show. Turn on Blind signing in the NEAR app's settings on your Ledger, then try again.`);
+        }
+        throw new Error("Your Ledger's NEAR app couldn't read this message (error 0xB005). Update the NEAR app in Ledger Live, then try again.");
+    }
+}
+
 function buildNep413Payload(message, recipient, nonce) {
     const messageBytes = new TextEncoder().encode(message);
     const recipientBytes = new TextEncoder().encode(recipient);
@@ -3292,7 +3337,7 @@ class LedgerWallet {
             const signature = await showLedgerApprovalUI(
                 "Sign Message",
                 "Please review and approve the message signing on your Ledger device.",
-                (onProgress) => sign(dataWithPrefix, derivationPath, onProgress),
+                (onProgress) => signNep413(dataWithPrefix, derivationPath, onProgress, { message, recipient }),
                 true,
             );
 
@@ -3444,7 +3489,7 @@ class LedgerWallet {
         const signature = await showLedgerApprovalUI(
             "Sign Message",
             "Please review and approve the message signing on your Ledger device.",
-            (onProgress) => sign(dataWithPrefix, derivationPath, onProgress),
+            (onProgress) => signNep413(dataWithPrefix, derivationPath, onProgress, { message, recipient }),
             true,
         );
 

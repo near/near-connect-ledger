@@ -129,6 +129,16 @@ yet can't sign in. On testnet the user is asked to fund it first.
 Every error says what to do next: fix the ID, choose another name, check the
 connection and retry, or go back and pick another account.
 
+### Long NEP-413 messages
+
+The NEAR Ledger app shows at most 400 bytes of a NEP-413 `message`, 64 of the
+`recipient` and 100 of the `callback_url`. Since app v2.6 a longer field is
+rejected with `0xB005` unless **Blind signing** is on in the app's settings
+([LedgerHQ/app-near#54](https://github.com/LedgerHQ/app-near/issues/54)). When
+that happens the executor names the field and its size and asks the user to
+turn Blind signing on. Note that a recipient that embeds an implicit account
+id (64 characters) is always over the limit.
+
 ### Review timeout
 
 APDU responses are awaited for up to 7 minutes (`DEVICE_REVIEW_TIMEOUT_MS`):
