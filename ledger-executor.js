@@ -108,6 +108,77 @@ async function isNativeBLEAvailable() {
 }
 
 // ============================================================================
+// In-flight device request (abortable)
+// ============================================================================
+
+// A device that goes offline mid-request (unplugged, locked, app closed,
+// Bluetooth dropped) may never answer, so every request to the Ledger can be
+// ended early: by the Retry / Cancel buttons on the waiting screen, or by a
+// disconnect event from the browser.
+const LEDGER_RETRY = "LEDGER_RETRY";
+const LEDGER_DISCONNECTED = "LEDGER_DISCONNECTED";
+const LEDGER_DISCONNECTED_MESSAGE = "Your Ledger was disconnected.";
+
+let _inflightRequest = null; // { reject, cleanups: Array<() => void> }
+
+/** Run `exchange()` as the in-flight request, so it can be aborted. */
+function trackDeviceRequest(exchange) {
+    return new Promise((resolve, reject) => {
+        const request = { reject, cleanups: [] };
+        _inflightRequest = request;
+        const settle = (fn) => (value) => {
+            if (_inflightRequest !== request) return; // already aborted
+            _inflightRequest = null;
+            fn(value);
+        };
+        exchange().then(settle(resolve), settle(reject));
+    });
+}
+
+/** Register cleanup for the in-flight request (listeners, timers). */
+function onDeviceRequestAbort(cleanup) {
+    if (_inflightRequest) _inflightRequest.cleanups.push(cleanup);
+}
+
+/**
+ * End the in-flight request with `error`. Returns false when nothing is in
+ * flight. The caller decides what happens to the connection.
+ */
+function abortDeviceRequest(error) {
+    const request = _inflightRequest;
+    if (!request) return false;
+    _inflightRequest = null;
+    for (const cleanup of request.cleanups) {
+        try { cleanup(); } catch { }
+    }
+    request.reject(error);
+    return true;
+}
+
+function ledgerError(message, code) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+}
+
+function isRetryRequest(error) {
+    return error?.code === LEDGER_RETRY;
+}
+
+// Waiting screens carry Retry / Cancel buttons (see deviceWaitHtml).
+document.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-ledger-wait]");
+    if (!button) return;
+    const action = button.getAttribute("data-ledger-wait");
+    const error = action === "retry"
+        ? ledgerError("Retrying the Ledger request", LEDGER_RETRY)
+        : new Error("User cancelled");
+    if (abortDeviceRequest(error)) {
+        document.querySelectorAll("[data-ledger-wait]").forEach(b => { b.disabled = true; });
+    }
+});
+
+// ============================================================================
 // USB Transport (WebUSB preferred, WebHID fallback)
 // ============================================================================
 
@@ -238,7 +309,8 @@ async function usbExchange(apdu) {
 let _hidDevice = null;
 
 async function hidExchange(apdu) {
-    if (!_hidDevice || !_hidDevice.opened) throw new Error("HID device not open");
+    const device = _hidDevice;
+    if (!device || !device.opened) throw new Error("HID device not open");
 
     const dataLen = apdu.length;
     let offset = 0;
@@ -262,7 +334,7 @@ async function hidExchange(apdu) {
             packet.set(apdu.subarray(offset, offset + chunkLen), headerLen);
             offset += chunkLen;
         }
-        await _hidDevice.sendReport(0, packet);
+        await device.sendReport(0, packet);
         seq++;
     }
 
@@ -273,16 +345,22 @@ async function hidExchange(apdu) {
 
     while (true) {
         const report = await new Promise((resolve, reject) => {
+            const stop = () => {
+                clearTimeout(timeout);
+                device.removeEventListener("inputreport", handler);
+            };
             const timeout = setTimeout(() => {
-                _hidDevice.removeEventListener("inputreport", handler);
+                stop();
                 reject(new Error("HID response timed out"));
             }, DEVICE_REVIEW_TIMEOUT_MS);
             function handler(event) {
-                clearTimeout(timeout);
-                _hidDevice.removeEventListener("inputreport", handler);
+                stop();
                 resolve(new Uint8Array(event.data.buffer));
             }
-            _hidDevice.addEventListener("inputreport", handler);
+            device.addEventListener("inputreport", handler);
+            // An aborted request must not leave a listener that would swallow
+            // the first report of the next one.
+            onDeviceRequestAbort(stop);
         });
 
         let rOffset = 0;
@@ -532,6 +610,7 @@ async function bleOpen(device, needsReconnect) {
 
 function _bleOnDisconnected() {
     console.log("[BLE] device disconnected");
+    if (_activeTransportMode === TRANSPORT_WEB_BLE) onLedgerDisconnected();
     // Drop the session, keep _bleKnownDevice for a silent reconnect.
     _bleDevice = null;
     _bleWriteChar = null;
@@ -588,6 +667,10 @@ let _activeTransport = null;
 let _activeTransportMode = null;
 
 async function transportExchange(apdu) {
+    return await trackDeviceRequest(() => rawTransportExchange(apdu));
+}
+
+async function rawTransportExchange(apdu) {
     if (_activeTransportMode === TRANSPORT_WEB_USB) {
         return await usbExchange(apdu);
     }
@@ -709,6 +792,36 @@ async function transportConnect(mode) {
     } else {
         throw new Error("Unknown transport mode: " + mode);
     }
+}
+
+/** The active device went away: end the in-flight request and drop the session. */
+function onLedgerDisconnected() {
+    abortDeviceRequest(ledgerError(LEDGER_DISCONNECTED_MESSAGE, LEDGER_DISCONNECTED));
+}
+
+if (isWebUsbSupported()) {
+    navigator.usb.addEventListener("disconnect", (event) => {
+        if (event.device !== _usbDevice) return;
+        console.log("[USB] device disconnected");
+        _usbDevice = null;
+        if (_activeTransportMode === TRANSPORT_WEB_USB) {
+            _activeTransport = null;
+            _activeTransportMode = null;
+        }
+        onLedgerDisconnected();
+    });
+}
+if (isWebHidSupported()) {
+    navigator.hid.addEventListener("disconnect", (event) => {
+        if (event.device !== _hidDevice) return;
+        console.log("[HID] device disconnected");
+        _hidDevice = null;
+        if (_activeTransportMode === TRANSPORT_WEB_HID) {
+            _activeTransport = null;
+            _activeTransportMode = null;
+        }
+        onLedgerDisconnected();
+    });
 }
 
 /** Close the session. `forget` also drops the remembered Bluetooth device (signOut). */
@@ -1028,6 +1141,7 @@ async function lookupAccountsByPublicKey(network, publicKey) {
 
 function getLedgerErrorMessage(error) {
     const msg = error.message || "";
+    if (error.code === LEDGER_DISCONNECTED) return "Your Ledger was disconnected. Reconnect it, unlock it and open the NEAR app, then try again.";
     if (msg.includes("0xb005") || msg.includes("UNKNOWN_ERROR")) return "Please approve opening the NEAR app on your Ledger device.";
     if (msg.includes("0x5515") || msg.includes("Locked device")) return "Your Ledger device is locked. Please unlock it and try again.";
     if (msg.includes("6807") || msg.includes("NEAR application is missing")) return "NEAR application is not installed on your Ledger device. Please install it using Ledger Live.";
@@ -1121,6 +1235,7 @@ const LEDGER_STYLES = `
 }
 .lc-btn-primary { border:none; background:#fafafa; color:#0b0b0c; }
 .lc-btn-secondary { border:1px solid var(--lc-border-strong); background:transparent; color:var(--lc-text); }
+.lc-wait-help { display:flex; flex-direction:column; gap:10px; margin-top:4px; text-align:center; }
 .lc-card {
   width:100%; padding:14px; border-radius:14px; border:1px solid var(--lc-border); background:var(--lc-surface);
   cursor:pointer; text-align:left; box-sizing:border-box; font-family:var(--lc-font); color:var(--lc-text);
@@ -1319,7 +1434,7 @@ function spinnerHtml() {
 }
 
 // Waiting for the user to act on the device (approve, review, open the app).
-function deviceWaitHtml(hint = "Waiting for confirmation on your Ledger…") {
+function deviceWaitHtml(hint = "Waiting for confirmation on your Ledger…", withHelp = true) {
     return `<div class="lc-visual" role="status">
       <div class="lc-device" aria-hidden="true">
         <div class="lc-device-icon">
@@ -1331,6 +1446,18 @@ function deviceWaitHtml(hint = "Waiting for confirmation on your Ledger…") {
         </div>
       </div>
       <p class="lc-hint"><span class="lc-dot" aria-hidden="true"></span><span>${hint}</span></p>
+    </div>${withHelp ? waitHelpHtml() : ""}`;
+}
+
+// Way out of a request the Ledger never answers (offline, locked, app closed).
+function waitHelpHtml() {
+    return `
+    <div class="lc-wait-help">
+      <p class="lc-hint">Ledger not responding? Check that it's connected, unlocked and on the NEAR app.</p>
+      <div class="lc-actions">
+        <button type="button" data-ledger-wait="retry" class="lc-btn lc-btn-secondary">Retry</button>
+        <button type="button" data-ledger-wait="cancel" class="lc-btn lc-btn-secondary">Cancel</button>
+      </div>
     </div>`;
 }
 
@@ -1397,13 +1524,14 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
               <span class="lc-title">${title}</span>
               <p class="lc-text">${message}</p>
             </div>
-            <div id="ledgerSpinner">${deviceWaitHtml()}</div>
+            <div id="ledgerSpinner">${deviceWaitHtml(undefined, false)}</div>
             <div id="ledgerProgress" class="lc-progress" style="display:none;">
               <div class="lc-progress-track">
                 <div id="ledgerProgressBar" class="lc-progress-bar" style="width:0%;"></div>
               </div>
               <p id="ledgerProgressText" class="lc-hint"></p>
             </div>
+            ${waitHelpHtml()}
           </div>
         </div>`;
     }
@@ -1425,7 +1553,7 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
         if (current >= total) {
             progress.style.display = "none";
             if (spinner) {
-                spinner.innerHTML = deviceWaitHtml("All data sent. Review and approve on your Ledger…");
+                spinner.innerHTML = deviceWaitHtml("All data sent. Review and approve on your Ledger…", false);
                 spinner.style.display = "block";
             }
             return;
@@ -1474,6 +1602,10 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
             // A retry after a lost connection needs a fresh link first.
             if (!(await transportIsConnected())) await reconnectLedger();
         } catch (error) {
+            if (isRetryRequest(error)) {
+                await transportDisconnect();
+                continue;
+            }
             if (error.message !== "User cancelled") {
                 renderErrorUI(error);
                 const action = await waitForRetryAction();
@@ -1494,6 +1626,19 @@ async function showLedgerApprovalUI(title, message, asyncOperation, hideOnSucces
             }
             return result;
         } catch (error) {
+            if (isRetryRequest(error)) {
+                // The device may never answer the abandoned request: start
+                // over on a fresh connection.
+                await transportDisconnect();
+                continue;
+            }
+            if (error.message === "User cancelled") {
+                await transportDisconnect();
+                root.innerHTML = "";
+                root.style.display = "none";
+                window.selector.ui.hideIframe();
+                throw error;
+            }
             renderErrorUI(error);
             const action = await waitForRetryAction();
             if (action === "retry") continue;
@@ -1580,6 +1725,17 @@ async function promptForLedgerConnect() {
                     await openNearApplication();
                     resolve();
                 } catch (error) {
+                    if (isRetryRequest(error)) {
+                        await transportDisconnect();
+                        return attempt();
+                    }
+                    if (error.message === "User cancelled") {
+                        await transportDisconnect();
+                        root.innerHTML = "";
+                        root.style.display = "none";
+                        window.selector.ui.hideIframe();
+                        return reject(error);
+                    }
                     const errorMsg = getLedgerErrorMessage(error);
                     if (!isGuidanceMessage(errorMsg) && await transportIsConnected()) {
                         await transportDisconnect();
@@ -1703,6 +1859,17 @@ async function promptForLedgerConnect() {
                 await openNearApplication();
                 resolve();
             } catch (error) {
+                if (isRetryRequest(error)) {
+                    await transportDisconnect();
+                    return handleConnect(mode);
+                }
+                if (error.message === "User cancelled") {
+                    await transportDisconnect();
+                    root.innerHTML = "";
+                    root.style.display = "none";
+                    window.selector.ui.hideIframe();
+                    return reject(error);
+                }
                 const errorMessage = getLedgerErrorMessage(error);
                 if (!isGuidanceMessage(errorMessage) && await transportIsConnected()) {
                     await transportDisconnect();
@@ -2848,7 +3015,9 @@ async function reconnectLedger() {
                 await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
                 return;
             }
-        } catch {
+        } catch (error) {
+            // Retry / Cancel on the waiting screen are the user's call, not a failed reconnect.
+            if (isRetryRequest(error) || error?.message === "User cancelled") throw error;
             // WebUSB silent reconnect failed — fall through to manual reconnect
         }
     }
@@ -2862,7 +3031,9 @@ async function reconnectLedger() {
             await openNearApplication();
             await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
             return;
-        } catch {
+        } catch (error) {
+            // Retry / Cancel on the waiting screen are the user's call, not a failed reconnect.
+            if (isRetryRequest(error) || error?.message === "User cancelled") throw error;
             // Native BLE reconnect failed — fall through to manual reconnect
         }
     }
@@ -2876,7 +3047,9 @@ async function reconnectLedger() {
             await openNearApplication();
             await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
             return;
-        } catch {
+        } catch (error) {
+            // Retry / Cancel on the waiting screen are the user's call, not a failed reconnect.
+            if (isRetryRequest(error) || error?.message === "User cancelled") throw error;
             // Out of range / asleep / unpaired — fall through to the Connect button.
         }
     }
@@ -2910,7 +3083,17 @@ async function reconnectLedger() {
               </div>
             </div>`;
 
-            document.getElementById("reconnectBtn").addEventListener("click", async () => {
+            document.getElementById("reconnectBtn").addEventListener("click", attemptReconnect);
+
+            document.getElementById("reconnectCancelBtn").addEventListener("click", () => {
+                root.innerHTML = "";
+                root.style.display = "none";
+                window.selector.ui.hideIframe();
+                reject(new Error("User cancelled"));
+            });
+        }
+
+        async function attemptReconnect() {
                 root.innerHTML = `
                 <div class="lc-screen">
                   <div class="lc-body">
@@ -2930,17 +3113,20 @@ async function reconnectLedger() {
                     await showStatusScreen("Preparing Request", "Getting your request ready for signing…");
                     resolve();
                 } catch (error) {
+                    if (isRetryRequest(error)) {
+                        await transportDisconnect();
+                        return attemptReconnect();
+                    }
+                    if (error.message === "User cancelled") {
+                        await transportDisconnect();
+                        root.innerHTML = "";
+                        root.style.display = "none";
+                        window.selector.ui.hideIframe();
+                        return reject(error);
+                    }
                     const errorMsg = getLedgerErrorMessage(error);
                     renderConnectButton(errorMsg);
                 }
-            });
-
-            document.getElementById("reconnectCancelBtn").addEventListener("click", () => {
-                root.innerHTML = "";
-                root.style.display = "none";
-                window.selector.ui.hideIframe();
-                reject(new Error("User cancelled"));
-            });
         }
 
         renderConnectButton(null);
