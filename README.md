@@ -117,6 +117,15 @@ name is entered with a fixed `.near` suffix, and dotted names such as
 accounts under it. The name is checked for availability before creation. On
 testnet there is no creation offer.
 
+### The Ledger's own implicit account
+
+The account picker always offers the Ledger key's implicit account (the hex of
+its public key). If that account isn't on-chain yet, picking it on mainnet
+shows a "Set Up Your Account" step that creates it through the same account
+service (`POST https://api.trezu.app/api/user/create`). Apps verify a sign-in by
+looking the key up on the account, so an implicit account that doesn't exist
+yet can't sign in. On testnet the user is asked to fund it first.
+
 Every error says what to do next: fix the ID, choose another name, check the
 connection and retry, or go back and pick another account.
 

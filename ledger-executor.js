@@ -2116,9 +2116,10 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
         }
 
         /**
-         * Verify `accountId`; if it doesn't exist, offer to create a new
-         * `name.near` (mainnet only). Re-renders the picker with a message
-         * saying what to do when that doesn't work out.
+         * Verify `accountId`; if it doesn't exist, offer to set up this
+         * Ledger's own implicit account or to create a new `name.near`
+         * (mainnet only). Re-renders the picker with a message saying what to
+         * do when that doesn't work out.
          */
         async function tryAccount(accountId, manualValue) {
             const showManual = manualValue !== null;
@@ -2127,6 +2128,16 @@ async function promptForAccountId(foundAccounts = [], implicitAccountId = "", on
                 await onVerify(accountId);
                 return finish(accountId);
             } catch (error) {
+                if (error?.code === "IMPLICIT_ACCOUNT_SETUP_REQUIRED") {
+                    if (!onCreateAccount || network !== NEW_ACCOUNT_NETWORK) {
+                        renderUI(`<strong>${escapeHtml(accountId)}</strong> isn't on ${escapeHtml(network)} yet. Send it a small amount of NEAR to set it up, then try again, or choose another account.`, manualValue ?? "", showManual);
+                        return setupListeners();
+                    }
+                    const setUp = await promptForImplicitAccountSetup(accountId, network, onCreateAccount);
+                    if (setUp) return finish(setUp);
+                    renderUI(null, manualValue ?? "", showManual);
+                    return setupListeners();
+                }
                 if (error?.code !== "ACCOUNT_CREATION_REQUIRED") {
                     renderUI(accountCheckMessage(error, accountId), manualValue ?? "", showManual);
                     return setupListeners();
@@ -2265,6 +2276,18 @@ function accountCreationRequired(accountId) {
 }
 
 /**
+ * This Ledger key's own implicit account, not on-chain yet. It belongs to the
+ * key, but apps can't verify a sign-in for an account that doesn't exist, so
+ * it has to be set up (funded) first.
+ */
+function implicitAccountSetupRequired(accountId) {
+    return userError(
+        `<strong>${escapeHtml(accountId)}</strong> isn't on NEAR yet.`,
+        "IMPLICIT_ACCOUNT_SETUP_REQUIRED",
+    );
+}
+
+/**
  * Check that `publicKey` is a full-access key of `accountId`.
  *
  * One view_access_key call in the common case. Only when the key isn't found
@@ -2272,9 +2295,11 @@ function accountCreationRequired(accountId) {
  * "access key does not exist" for a missing account too; 2.14 reports
  * UNKNOWN_ACCOUNT directly, after which this fallback can go.
  *
- * A missing account is fine when it's this key's own implicit account — it
- * comes into existence when first funded. Any other missing account gets the
- * "create account" offer instead of a dead end.
+ * A missing account that is this key's own implicit account gets the "set up
+ * this account" offer: it belongs to the key, but apps verifying a sign-in
+ * (e.g. Trezu's login) look the key up on-chain and fail until it is funded.
+ * Any other missing account gets the "create account" offer instead of a dead
+ * end.
  */
 async function verifyAccessKey(network, accountId, publicKey) {
     let accessKey;
@@ -2292,7 +2317,7 @@ async function verifyAccessKey(network, accountId, publicKey) {
                 throw userError(`This Ledger isn't linked to <strong>${escapeHtml(accountId)}</strong>. Check that it's the right account, or first add this Ledger's key to it (for example, in the wallet you use for that account), then try again.`);
             }
         }
-        if (isImplicitAccountOf(accountId, publicKey)) return true;
+        if (isImplicitAccountOf(accountId, publicKey)) throw implicitAccountSetupRequired(accountId);
         throw accountCreationRequired(accountId);
     }
     if (accessKey.permission !== "FullAccess") {
@@ -2322,10 +2347,76 @@ async function createUserAccountViaApi(accountId, publicKey) {
 
     // The service answers errors in plain text; keep it for debugging only.
     console.log("[Ledger] account creation failed:", response.status, await response.text().catch(() => ""));
-    if (response.status === 409) throw userError(`${shown} is already taken. Try a different name.`);
-    if (response.status === 400 || response.status === 422) throw userError(`${shown} can't be created. Try a different name.`);
+    if (response.status === 409) throw userError(`${shown} is already taken. Try a different name.`, "ACCOUNT_EXISTS");
+    if (response.status === 400 || response.status === 422) throw userError(`${shown} can't be created. Try a different name.`, "ACCOUNT_REJECTED");
     if (response.status === 429) throw userError("Too many attempts. Wait a minute, then try again.");
     throw userError(`Couldn't create ${shown} right now. Wait a minute, then try again.`);
+}
+
+/**
+ * Offer to set up this Ledger key's own implicit account, which isn't on-chain
+ * yet, through the account service. Resolves with the account ID once it
+ * exists, or null when the user goes back.
+ */
+async function promptForImplicitAccountSetup(accountId, network, onCreateAccount) {
+    ensureLedgerStyles();
+    const root = document.getElementById("root");
+    root.style.display = "flex";
+
+    const shown = `<strong class="lc-em lc-mono">${escapeHtml(accountId)}</strong>`;
+
+    function renderUI(errorMessage = null) {
+        root.innerHTML = `
+        <div class="lc-screen">
+          <div class="lc-body">
+            <div class="lc-header">
+              <span class="lc-title">Set Up Your Account</span>
+              <p class="lc-text lc-break">${shown} is this Ledger's own address, but it isn't on NEAR yet. Set it up now to sign in with it. It stays controlled by this Ledger.</p>
+            </div>
+            <div class="lc-stack">
+              ${errorMessage ? alertBox(errorMessage) : ""}
+              <div class="lc-actions">
+                <button id="setupAccountConfirmBtn" class="lc-btn lc-btn-primary">Set Up Account</button>
+                <button id="setupAccountCancelBtn" class="lc-btn lc-btn-secondary">Back</button>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    renderUI();
+
+    return new Promise((resolve) => {
+        function setupListeners() {
+            const cancelBtn = document.getElementById("setupAccountCancelBtn");
+            const setupBtn = document.getElementById("setupAccountConfirmBtn");
+
+            cancelBtn.addEventListener("click", () => resolve(null));
+            setTimeout(() => setupBtn.focus(), 100);
+
+            setupBtn.addEventListener("click", async () => {
+                setButtonLoading(setupBtn, "Setting up…");
+                cancelBtn.disabled = true;
+                try {
+                    await onCreateAccount(accountId);
+                    resolve(accountId);
+                } catch (error) {
+                    // Already on-chain (set up meanwhile, e.g. funded by someone): use it.
+                    if (error?.code === "ACCOUNT_EXISTS") return resolve(accountId);
+                    console.log("[Ledger] implicit account setup failed:", error);
+                    // The service's own messages are worded for named accounts
+                    // ("try a different name"); keep only the generic ones.
+                    const message = error?.userFacing && error.code !== "ACCOUNT_REJECTED"
+                        ? error.message
+                        : "Couldn't set up this account right now. Wait a minute, then try again.";
+                    renderUI(message);
+                    setupListeners();
+                }
+            });
+        }
+
+        setupListeners();
+    });
 }
 
 /**
