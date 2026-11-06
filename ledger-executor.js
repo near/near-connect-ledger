@@ -2501,27 +2501,117 @@ async function verifyAccessKey(network, accountId, publicKey) {
 // Account Creation
 // ============================================================================
 
-async function createUserAccountViaApi(accountId, publicKey) {
+// Accounts are created by the account sponsor contract on helper.trezu.near
+// (https://github.com/NEAR-DevHub/near-account-sponsor), called with the
+// function-call key below. That key is public on purpose: it can only call
+// create_named_account / create_implicit_account on helper.trezu.near, and
+// the contract adds no deposit, rate-limits creations and only creates
+// `<name>.near` (one level) and implicit accounts.
+const SPONSOR_ACCOUNT_ID = "helper.trezu.near";
+const SPONSOR_PRIVATE_KEY = "ed25519:2SnNSsd7g67Be3jvF8cnxA8eps87hTKXrdw3YFPT1Bvx2VvAUfS3Q6PiczSN36sNoPrMQ2uZhJfZuPQ7mNcqpw38";
+const SPONSOR_CALL_GAS = "50000000000000"; // 50 TGas (30 TGas go to near.create_account)
+const SPONSOR_NETWORK = "mainnet";
+
+function base64Url(bytes) {
+    return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Sign a transaction with the sponsor's function-call key (WebCrypto Ed25519). */
+async function signWithSponsorKey(txBytes) {
+    const keyBytes = base58Decode(SPONSOR_PRIVATE_KEY.slice("ed25519:".length));
+    const key = await crypto.subtle.importKey(
+        "jwk",
+        { kty: "OKP", crv: "Ed25519", d: base64Url(keyBytes.subarray(0, 32)), x: base64Url(keyBytes.subarray(32, 64)) },
+        { name: "Ed25519" },
+        false,
+        ["sign"],
+    );
+    const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", txBytes));
+    return new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, hash));
+}
+
+function sponsorPublicKey() {
+    const keyBytes = base58Decode(SPONSOR_PRIVATE_KEY.slice("ed25519:".length));
+    return `ed25519:${base58Encode(keyBytes.subarray(32, 64))}`;
+}
+
+/** Call a method of the sponsor contract; returns the final execution outcome. */
+async function callSponsor(methodName, args) {
+    const publicKey = sponsorPublicKey();
+    const actions = [{ type: "FunctionCall", params: { methodName, args, gas: SPONSOR_CALL_GAS, deposit: "0" } }];
+    // Every Ledger user shares this key, so a nonce can be taken by someone
+    // else between reading and sending it: re-read and retry a few times.
+    for (let attempt = 0; ; attempt++) {
+        const [accessKey, block] = await Promise.all([
+            rpcRequest(SPONSOR_NETWORK, "query", {
+                request_type: "view_access_key",
+                finality: "final",
+                account_id: SPONSOR_ACCOUNT_ID,
+                public_key: publicKey,
+            }),
+            rpcRequest(SPONSOR_NETWORK, "block", { finality: "final" }),
+        ]);
+        const nonce = BigInt(accessKey.nonce) + 1n + BigInt(Math.floor(Math.random() * 1000));
+        const txBytes = buildTransaction(
+            SPONSOR_ACCOUNT_ID,
+            publicKey,
+            SPONSOR_ACCOUNT_ID,
+            nonce,
+            actions,
+            base58Decode(block.header.hash),
+        );
+        const signature = await signWithSponsorKey(txBytes);
+        const signedTx = new Uint8Array(txBytes.length + 1 + 64);
+        signedTx.set(txBytes, 0);
+        signedTx[txBytes.length] = 0; // ed25519
+        signedTx.set(signature, txBytes.length + 1);
+        try {
+            return await rpcRequest(SPONSOR_NETWORK, "send_tx", {
+                signed_tx_base64: bytesToBase64(signedTx),
+                wait_until: "FINAL",
+            });
+        } catch (error) {
+            if (attempt < 3 && /InvalidNonce|nonce/i.test(`${error?.message} ${error?.data}`)) continue;
+            throw error;
+        }
+    }
+}
+
+/**
+ * Create `accountId` for this Ledger's `publicKey` through the sponsor:
+ * a `<name>.near` account with the key as its full-access key, or this key's
+ * own implicit account (64 hex).
+ */
+async function createUserAccountViaSponsor(accountId, publicKey) {
     const shown = `<strong>${escapeHtml(accountId)}</strong>`;
-    let response;
+    const implicit = /^[0-9a-f]{64}$/.test(accountId);
+    let outcome;
     try {
-        response = await fetch("https://api.trezu.app/api/user/create", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ accountId, publicKey }),
-        });
+        outcome = implicit
+            ? await callSponsor("create_implicit_account", { account_id: accountId })
+            : await callSponsor("create_named_account", { account_id: accountId, public_key: publicKey });
     } catch (error) {
         console.log("[Ledger] account creation request failed:", error);
         throw userError("Couldn't reach the account service. Check your internet connection and try again.");
     }
-    if (response.ok) return await response.json().catch(() => null);
 
-    // The service answers errors in plain text; keep it for debugging only.
-    console.log("[Ledger] account creation failed:", response.status, await response.text().catch(() => ""));
-    if (response.status === 409) throw userError(`${shown} is already taken. Try a different name.`, "ACCOUNT_EXISTS");
-    if (response.status === 400 || response.status === 422) throw userError(`${shown} can't be created. Try a different name.`, "ACCOUNT_REJECTED");
-    if (response.status === 429) throw userError("Too many attempts. Wait a minute, then try again.");
-    throw userError(`Couldn't create ${shown} right now. Wait a minute, then try again.`);
+    const status = outcome?.status ?? {};
+    if (status.Failure) {
+        const detail = JSON.stringify(status.Failure);
+        console.log("[Ledger] account creation failed:", detail);
+        if (/Too many accounts created recently/.test(detail)) {
+            throw userError("Too many accounts are being created right now. Wait a few minutes, then try again.");
+        }
+        if (/already exists/i.test(detail)) throw userError(`${shown} is already taken. Try a different name.`, "ACCOUNT_EXISTS");
+        if (/Only direct sub-accounts/.test(detail)) throw userError(`${shown} can't be created. Try a different name.`, "ACCOUNT_REJECTED");
+        throw userError(`Couldn't create ${shown} right now. Wait a minute, then try again.`);
+    }
+    // The `near` registrar answers `false` (and creates nothing) when the name
+    // is taken.
+    if (!implicit && status.SuccessValue !== undefined && atob(status.SuccessValue) === "false") {
+        throw userError(`${shown} is already taken. Try a different name.`, "ACCOUNT_EXISTS");
+    }
+    return null;
 }
 
 /**
@@ -3234,7 +3324,7 @@ class LedgerWallet {
         };
 
         const createUserAccount = async (accountId) => {
-            await createUserAccountViaApi(accountId, publicKey);
+            await createUserAccountViaSponsor(accountId, publicKey);
         };
 
         const accountId = await promptForAccountId(foundAccounts, implicitAccountId, verifyAccount, createUserAccount, false, network);

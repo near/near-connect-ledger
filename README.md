@@ -122,7 +122,8 @@ testnet there is no creation offer.
 The account picker always offers the Ledger key's implicit account (the hex of
 its public key). If that account isn't on-chain yet, picking it on mainnet
 shows a "Set Up Your Account" step that creates it through the same account
-service (`POST https://api.trezu.app/api/user/create`). Apps verify a sign-in by
+service: the account sponsor contract on `helper.trezu.near`
+([near-account-sponsor](https://github.com/NEAR-DevHub/near-account-sponsor)). Apps verify a sign-in by
 looking the key up on the account, so an implicit account that doesn't exist
 yet can't sign in. On testnet the user is asked to fund it first.
 
