@@ -145,6 +145,18 @@ APDU responses are awaited for up to 7 minutes (`DEVICE_REVIEW_TIMEOUT_MS`):
 signing responses only arrive after the user has reviewed and approved on the
 device, so this is the user's review time.
 
+### When the Ledger stops responding
+
+A Ledger that goes offline mid-request (unplugged, locked, NEAR app closed,
+Bluetooth dropped) may never answer, so the user is never left waiting for
+the full review timeout:
+
+- Every screen that waits on the device has **Retry** and **Cancel**. Retry
+  abandons the request, drops the connection, reconnects and sends the request
+  again; Cancel closes the connector.
+- A USB, HID or Bluetooth disconnect ends the request at once with "Your Ledger
+  was disconnected" and a **Try Again** button.
+
 ### Required permissions
 
 The manifest `permissions` ensure that near-connect delegates the necessary browser features to the sandboxed iframe via the `allow` attribute:
