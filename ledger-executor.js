@@ -3195,8 +3195,23 @@ async function reconnectLedger() {
     const root = document.getElementById("root");
     root.style.display = "flex";
 
+    // The transport picked at sign-in may no longer be the right one (e.g. the
+    // Ledger was on USB then and is only reachable over Bluetooth now), so the
+    // screen offers the other one when this environment supports it.
+    const usbAvailable = isWebUsbSupported() || isWebHidSupported();
+    const webBleAvailable = isWebBleSupported();
+    const bleAvailable = webBleAvailable || (await isNativeBLEAvailable());
+    const bleTransportMode = webBleAvailable ? TRANSPORT_WEB_BLE : TRANSPORT_NATIVE_BLE;
+    const isBleMode = (mode) => mode === TRANSPORT_WEB_BLE || mode === TRANSPORT_NATIVE_BLE;
+    let mode = storedMode;
+    const alternativeMode = () => {
+        if (isBleMode(mode)) return usbAvailable ? TRANSPORT_WEB_USB : null;
+        return bleAvailable ? bleTransportMode : null;
+    };
+
     await new Promise((resolve, reject) => {
         function renderConnectButton(errorMessage) {
+            const otherMode = alternativeMode();
             root.innerHTML = `
             <div class="lc-screen">
               <div class="lc-body">
@@ -3208,17 +3223,26 @@ async function reconnectLedger() {
                     </button>
                   </div>
                   <p class="lc-text">
-                    Please make sure your Ledger device is ${(storedMode === TRANSPORT_WEB_BLE || storedMode === TRANSPORT_NATIVE_BLE) ? "nearby and Bluetooth is enabled" : "connected via USB"}.
+                    Please make sure your Ledger device is ${isBleMode(mode) ? "nearby and Bluetooth is enabled" : "connected via USB"}.
                   </p>
                 </div>
                 ${errorMessage ? alertBox(errorMessage) : ""}
                 <div class="lc-actions">
-                  <button id="reconnectBtn" class="lc-btn lc-btn-primary">Connect</button>
+                  <button id="reconnectBtn" class="lc-btn lc-btn-primary">Connect${isBleMode(mode) ? " via Bluetooth" : " via USB"}</button>
+                  ${otherMode ? `<button id="switchTransportBtn" class="lc-btn lc-btn-secondary">Use ${isBleMode(otherMode) ? "Bluetooth" : "USB"} instead</button>` : ""}
                 </div>
               </div>
             </div>`;
 
             document.getElementById("reconnectBtn").addEventListener("click", attemptReconnect);
+
+            if (otherMode) {
+                document.getElementById("switchTransportBtn").addEventListener("click", async () => {
+                    if (await transportIsConnected()) await transportDisconnect();
+                    mode = otherMode;
+                    renderConnectButton(null);
+                });
+            }
 
             document.getElementById("reconnectCancelBtn").addEventListener("click", () => {
                 root.innerHTML = "";
@@ -3240,8 +3264,11 @@ async function reconnectLedger() {
                   </div>
                 </div>`;
                 try {
-                    if (!(await transportIsConnected())) {
-                        await transportConnect(storedMode);
+                    if (!(await transportIsConnected()) || _activeTransportMode !== mode) {
+                        if (await transportIsConnected()) await transportDisconnect();
+                        await transportConnect(mode);
+                        // Remember the transport that worked for the next reconnect.
+                        if (mode !== storedMode) await window.selector.storage.set(STORAGE_KEY_TRANSPORT_MODE, mode);
                     }
                     await openingNearApp();
                     await openNearApplication();
